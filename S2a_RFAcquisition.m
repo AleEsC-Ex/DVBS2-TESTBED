@@ -226,6 +226,19 @@ while true
     end
     prof.iters = prof.iters + 1;
 
+    % Yield to MATLAB's event queue before the blocking radio call below.
+    % tcpserver accepts its client ASYNCHRONOUSLY, and that accept is only
+    % processed when the event queue is serviced -- see S1a's identical
+    % comment for the full mechanism. This loop never yielded on its own
+    % (radioRx() blocks inside a MEX call), which is why
+    % retransmitServer.Connected stayed false for an ENTIRE run on hardware
+    % even as bytes visibly piled up in its buffer (NumBytesAvailable
+    % climbing while Connected read 0): S3's connection request, which
+    % only arrives well into the run once S3 first detects a gap, was never
+    % being accepted. Zero retransmit requests were relayed the whole run
+    % as a result. 'limitrate' caps this at roughly 20 Hz, matching S1a/S1b.
+    drawnow limitrate;
+
     %% 1. Acquire one block of raw samples
     if config.useSDR
         tRx = tic;
@@ -331,17 +344,15 @@ while true
         chunkNum = chunkNum + 1;
         if mod(chunkNum, 10) == 0
             if uplinkRF
-                % rtSrv/rtBytes are diagnostic, for the open question of why
-                % S3 reports retransmit requests sent while this process
-                % reads none. Everything checkable statically is correct --
-                % message format, port binding, socket topology, drain code
-                % -- so the remaining answers are visible only at runtime:
-                %
-                %   conn=0            S3 is not attached to THIS server
-                %   bytes climbing    they arrive but the read path fails
-                %   bytes stuck at 0  they never arrive, so look at S3's
-                %                     write (its profile now separates
-                %                     "attempted" from "write failures")
+                % rtSrv/rtBytes are diagnostic -- kept because they are what
+                % actually diagnosed the root cause: this loop never yielded
+                % to MATLAB's event queue (see the drawnow above), so
+                % retransmitServer's async client accept was never
+                % processed. conn stayed 0 for a whole run while bytes
+                % climbed anyway (OS-level data arriving, MATLAB object
+                % never latching Connected), which is exactly what pointed
+                % at the missing drawnow rather than a message-format or
+                % port-binding problem.
                 fprintf(['S2a: chunk %d | RSSI=%.2f dB | rawCFO=%.1f Hz | %d blocks | ' ...
                     'overruns %d | uplink %d sent, %d underruns | ' ...
                     'rt srv conn=%d bytes=%d | RT factor %.3f\n'], ...

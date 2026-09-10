@@ -17,15 +17,45 @@ This README is the short version.
 
 ---
 
+## Mission scenario
+
+This testbed emulates the RF link between a CubeSat and its ground
+station, split the way a real one would be: a low-rate, easy-to-close UHF
+link handles commanding, while a separate, higher-frequency link carries
+the payload downlink at a rate UHF could never sustain.
+
+- **Payload downlink, S-band (2 GHz here):** the CubeSat transmits its
+  payload data down to the ground station over DVB-S2 — an increasingly
+  common choice for smallsat downlinks that need more throughput than
+  legacy formats, backed by mature, off-the-shelf ground equipment.
+- **Command uplink, UHF (500 MHz here):** the CubeSat's receive antenna is
+  UHF, so commanding runs over CCSDS Telecommand — the standard real
+  missions use for spacecraft commanding — instead of riding on the
+  S-band carrier.
+
+Mapped onto the five processes: **S1a/S1b are the CubeSat** — it
+transmits its DVB-S2 downlink at 2 GHz and receives commands on its UHF
+receiver at 500 MHz, both on the same physical radio (`192.168.10.2`),
+exactly as a real CubeSat with one S-band and one UHF antenna would.
+**S2a/S2b/S3 are the ground station** — it receives the S-band downlink
+and transmits back over UHF whatever the link needs to send up: ACM
+feedback (so the CubeSat knows what MODCOD the channel currently
+supports) and selective-repeat ARQ retransmit requests for any payload
+data the ground station didn't receive cleanly.
+
+That's why "forward link" in this repo means CubeSat-to-ground and
+"return link" (or "uplink") means ground-to-CubeSat — the naming follows
+the mission, not just which USRP happens to transmit first.
+
 ## What it does
 
-- **Forward link (2 GHz):** DVB-S2 (ETSI EN 302 307-1) — waveform
-  generation, adaptive MODCOD selection driven by measured channel
-  conditions, and the full physical-layer receive chain (frame sync,
-  timing/CFO/phase recovery, LDPC/BCH decode).
-- **Return link (500 MHz):** CCSDS Telecommand (CCSDS 231.0-B, PLOP-2) —
-  carries ACM feedback reports and selective-repeat ARQ retransmit
-  requests back to the transmitter.
+- **Forward link, CubeSat → ground (2 GHz, S-band):** DVB-S2 (ETSI EN 302
+  307-1) — waveform generation, adaptive MODCOD selection driven by
+  measured channel conditions, and the full physical-layer receive chain
+  (frame sync, timing/CFO/phase recovery, LDPC/BCH decode).
+- **Return link, ground → CubeSat (500 MHz, UHF):** CCSDS Telecommand
+  (CCSDS 231.0-B, PLOP-2) — carries ACM feedback reports and
+  selective-repeat ARQ retransmit requests back to the CubeSat.
 - **Independent measurement:** per-packet CRC-8 and self-synchronizing
   BER/PER against a deterministic reference payload, decoupled from
   whether a frame decoded successfully — the system's own accuracy check,

@@ -69,8 +69,8 @@ are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 ```
 
 Runs default to `config.useSDR = false` (simulated channel, no hardware
-needed) — flip it in `Functions/Testbed/dvbs2TestbedConfig.m` to run on
-real USRPs. Per-run console logs land in `logs/` (gitignored).
+needed) — flip it in `Testbed/Functions/Testbed/dvbs2TestbedConfig.m` to
+run on real USRPs. Per-run console logs land in `logs/` (gitignored).
 
 ## Current status
 
@@ -98,22 +98,26 @@ these numbers.
 
 ## Repository layout
 
+All MATLAB source lives under `Testbed/`, kept separate from the README,
+docs, and the PowerShell entry points at the root:
+
 ```
-S1a_Transmitter.m, S1b_ACMControl.m,          The five live processes
-S2a_RFAcquisition.m, S2b_Reciever.m,
-S3_ProcessingUnit.m
-
-Functions/                                     Core DSP/PHY functions
-Functions/Uplink/                              CCSDS Telecommand chain
-Functions/TCP/                                 Inter-process transport
-Functions/Serialization/                       Wire-format pack/unpack
-Functions/Testbed/                             Shared config + ACM policy
-
-sdr_test/                                       Standalone hardware bring-up
-                                                 and commissioning scripts
-
-docs/ARCHITECTURE.md                            Full architecture reference
+README.md, docs/ARCHITECTURE.md                Documentation (you are here)
 Launch-DVBS2Testbed.ps1, Stop-DVBS2Testbed.ps1  Multi-process launcher
+
+Testbed/
+  S1a_Transmitter.m, S1b_ACMControl.m,          The five live processes
+  S2a_RFAcquisition.m, S2b_Reciever.m,
+  S3_ProcessingUnit.m
+
+  Functions/                                     Core DSP/PHY functions
+  Functions/Uplink/                              CCSDS Telecommand chain
+  Functions/TCP/                                 Inter-process transport
+  Functions/Serialization/                       Wire-format pack/unpack
+  Functions/Testbed/                             Shared config + ACM policy
+
+  sdr_test/                                       Standalone hardware bring-up
+                                                   and commissioning scripts
 ```
 
 ---

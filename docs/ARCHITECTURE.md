@@ -10,6 +10,12 @@ return link — and map each one directly onto the functions that implement it.
 **Platform:** MATLAB R2026a
 **Hardware:** NI USRP-2920 (downlink TX + uplink RX, `192.168.10.2`) · USRP-2922 (`192.168.10.3`)
 
+**A note on paths below:** every script and `Functions/` path in this
+document (and in `sdr_test/`) is relative to the repo's `Testbed/` folder,
+e.g. `Functions/dvbs2FrameSync.m` means `Testbed/Functions/dvbs2FrameSync.m`
+on disk. The root of the repo holds only this documentation and the two
+PowerShell launcher scripts, not MATLAB source.
+
 ---
 
 ## 1 · System overview

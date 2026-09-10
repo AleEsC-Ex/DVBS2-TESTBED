@@ -6,11 +6,12 @@
 
 .HOW THIS WORKS, FOR SOMEONE WHO HASN'T SCRIPTED THIS BEFORE
     Every S*.m script already finds its own folder via mfilename('fullpath')
-    and adds Functions/ to its own path, and every inter-process link uses
-    a connect-with-retry helper (dvbs2TCPConnectRetry / dvbs2TCPServerRetry).
-    That means STARTUP ORDER DOES NOT MATTER -- this script can open all
-    five windows back to back with no coordination logic, and each one
-    just waits until its counterpart shows up on the expected port.
+    and adds Testbed/Functions/ to its own path, and every inter-process
+    link uses a connect-with-retry helper (dvbs2TCPConnectRetry /
+    dvbs2TCPServerRetry). That means STARTUP ORDER DOES NOT MATTER -- this
+    script can open all five windows back to back with no coordination
+    logic, and each one just waits until its counterpart shows up on the
+    expected port.
 
     All this script does, five times over, is:
       1. build the command line MATLAB needs ( -r "run('...')" )
@@ -28,7 +29,9 @@ $ErrorActionPreference = 'Stop'
 
 # ---------------------------------------------------------------------
 # WHAT TO LAUNCH. Name is only used for window/log labelling; File is the
-# script's path relative to this launcher's own folder.
+# script's path relative to the Testbed/ folder (see $codeDir below) --
+# all the MATLAB source lives there, separate from this launcher and the
+# repo's docs/README at the root.
 # ---------------------------------------------------------------------
 $scripts = @(
     @{ Name = 'S1a'; File = 'S1a_Transmitter.m' }
@@ -68,6 +71,7 @@ function Find-MatlabExe {
 }
 
 $projectRoot = $PSScriptRoot
+$codeDir     = Join-Path $projectRoot 'Testbed'
 $matlabExe   = Find-MatlabExe
 $logDir      = Join-Path $projectRoot 'logs'
 if (-not (Test-Path $logDir)) {
@@ -100,7 +104,7 @@ if (Test-Path $stopScript) {
 }
 
 foreach ($s in $scripts) {
-    $scriptPath = Join-Path $projectRoot $s.File
+    $scriptPath = Join-Path $codeDir $s.File
     if (-not (Test-Path $scriptPath)) {
         Write-Warning "Skipping $($s.Name): $scriptPath not found."
         continue

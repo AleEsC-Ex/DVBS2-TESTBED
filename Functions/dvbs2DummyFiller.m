@@ -85,7 +85,7 @@ function filler = dvbs2DummyFiller(nSamples, sps, rolloff, filtSpan)
         end
 
         % Filtered as ONE contiguous run so the joins between consecutive
-        % dummies are seamless, for the same reason S1 no longer calls
+        % dummies are seamless, for the same reason S1a no longer calls
         % flushFilter between real frames. Only the very end of the cached
         % stream carries a partial pulse, and that is where it is sliced.
         txFilt = comm.RaisedCosineTransmitFilter( ...

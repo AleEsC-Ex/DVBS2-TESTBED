@@ -11,7 +11,7 @@ function modcod = dvbs2SelectMODCOD(mu, sigma, trendAdjDB, currentMODCOD, config
 %   rather than by the instantaneous SNR alone. This is the single place
 %   the MODCOD ladder is consulted, so the transmitter's steady-state
 %   policy (dvbs2ACMPolicy.m) and its one-shot link-establishment seed
-%   (S1_Transmitter.m) cannot drift apart.
+%   (S1a_Transmitter.m) cannot drift apart.
 %
 %   WHY mu - k*sigma RATHER THAN mu - constant: a fixed margin is
 %   unrelated to how much the channel actually moves, so it is
@@ -81,7 +81,7 @@ end
 function modcod = localCapUpwardJump(modcod, currentMODCOD, modcodSet, config)
 %LOCALCAPUPWARDJUMP Limit how far one decision may climb the ladder.
 %
-%   Every MODCOD change costs S1 a radio release and reopen, because
+%   Every MODCOD change costs S1a a radio release and reopen, because
 %   comm.SDRuTransmitter locks its input length and the waveform length
 %   changes with the MODCOD. That is a real gap in the transmitted carrier.
 %   A link that jumps from the bottom of the ladder to the top on its first
@@ -95,7 +95,7 @@ function modcod = localCapUpwardJump(modcod, currentMODCOD, modcodSet, config)
 %   config.acm.agreeCountDown and .minDwellSecDown already encode.
 %
 %   At link establishment there is no current MODCOD, so the cap is measured
-%   from whatever S1 has actually been transmitting during calibration --
+%   from whatever S1a has actually been transmitting during calibration --
 %   config.dvbs2.MODCOD. Without that, the very first decision would be the
 %   largest jump of the whole run, which is precisely the one to avoid.
 

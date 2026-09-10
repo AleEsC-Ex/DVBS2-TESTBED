@@ -6,7 +6,7 @@ function [accept, reason] = dvbs2FrameAcceptable(phyParams, config)
 %   phyParams - decoded PLHEADER struct from dvbs2PLHeaderRecover.m
 %   config    - testbed config; reads config.rxReject.* (see below)
 %
-%   accept    - true if this header is consistent with what S1 is
+%   accept    - true if this header is consistent with what S1a is
 %               configured to transmit
 %   reason    - '' when accepted; otherwise a short human-readable phrase
 %               naming the single assumption that was violated
@@ -20,7 +20,7 @@ function [accept, reason] = dvbs2FrameAcceptable(phyParams, config)
 %   observed on hardware as PLS=47, PLS=71, and a ModulationOrder=16
 %   decode on a QPSK-only link.
 %
-%   The defence is that S2 already knows what S1 is allowed to send. A
+%   The defence is that S2b already knows what S1a is allowed to send. A
 %   header describing anything else is not a marginal frame to be decoded
 %   carefully; it is proof that this particular decode is wrong.
 %
@@ -42,7 +42,7 @@ function [accept, reason] = dvbs2FrameAcceptable(phyParams, config)
     % The whole receive chain downstream of here is pilot-based:
     % dvbs2FineFreqEst, dvbs2PhaseCompensate and dvbs2SNREstimate all
     % take fp and all three degrade to a much cruder fallback without
-    % pilots. S1 transmits pilots on every frame, so HasPilots = false
+    % pilots. S1a transmits pilots on every frame, so HasPilots = false
     % can only mean the TYPE field's pilot bit was flipped in the decode.
     %
     % TO REMOVE: the non-pilot paths have to be trustworthy first. The
@@ -56,13 +56,13 @@ function [accept, reason] = dvbs2FrameAcceptable(phyParams, config)
     end
 
     % --- 2. NORMAL FECFRAME REQUIRED ---------------------------------
-    % S1 only ever builds 64800-bit normal FECFRAMEs. A short-frame
+    % S1a only ever builds 64800-bit normal FECFRAMEs. A short-frame
     % decode (16200) is a flipped TYPE bit, and it is a particularly
     % damaging one: it makes dvbs2FrameLength return roughly a quarter of
     % the true length, so the receiver consumes a fraction of the frame
     % and resumes its SOF search in the middle of the payload.
     %
-    % TO REMOVE: S1 has to actually transmit short frames, and the
+    % TO REMOVE: S1a has to actually transmit short frames, and the
     % LDPC/BCH tables for the short-frame code rates have to be wired up.
     if isfield(r, 'requireNormalFrame') && r.requireNormalFrame && ...
             double(phyParams.FECFrameLength) ~= 64800
@@ -72,14 +72,14 @@ function [accept, reason] = dvbs2FrameAcceptable(phyParams, config)
         return;
     end
 
-    % --- 3. MODCOD MUST BE ONE S1 CAN SELECT -------------------------
+    % --- 3. MODCOD MUST BE ONE S1a CAN SELECT -------------------------
     % The PLS code packs as MODCOD*4 + TYPE, so the MODCOD index is the
     % top 5 bits. dvbs2PLHeaderRecover already uses the same convention
     % for its dummy test (PLSDecimalCode < 4 is MODCOD 0), and it matches
-    % the hardware logs exactly: PLS 5/17/29/41/45 against S1's reported
+    % the hardware logs exactly: PLS 5/17/29/41/45 against S1a's reported
     % MODCOD 1/4/7/10/11.
     %
-    % S1's ACM policy can only ever choose from config.acm.modcodSet, so
+    % S1a's ACM policy can only ever choose from config.acm.modcodSet, so
     % anything outside it is unreachable by construction -- not unlikely,
     % impossible. This is the check that catches a QPSK link decoding to
     % 16APSK, which no amount of confidence weighting would have caught,

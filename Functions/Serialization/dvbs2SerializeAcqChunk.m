@@ -1,5 +1,5 @@
 function payloadBytes = dvbs2SerializeAcqChunk(rssiDB, cfoEstHz, samples)
-%DVBS2SERIALIZEACQCHUNK Pack one acquisition chunk (samples + its scalars) for the S2a-to-S2 link.
+%DVBS2SERIALIZEACQCHUNK Pack one acquisition chunk (samples + its scalars) for the S2a-to-S2b link.
 %
 %   payloadBytes = dvbs2SerializeAcqChunk(rssiDB, cfoEstHz, samples)
 %   encodes one block of front-end-processed samples together with the

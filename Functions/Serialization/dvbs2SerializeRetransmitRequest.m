@@ -17,7 +17,7 @@ function payloadBytes = dvbs2SerializeRetransmitRequest(startIdx, endIdx)
 %   nothing usable AND makes an oversized request unrepresentable rather
 %   than merely rejected on arrival -- a corrupted index can no longer ask
 %   the transmitter to build a two-billion-element range, which is the bug
-%   that previously killed S1 with a 16 GB allocation.
+%   that previously killed S1a with a 16 GB allocation.
 %
 %   TimestampSec was dropped: it was written on every request and read by
 %   nothing.

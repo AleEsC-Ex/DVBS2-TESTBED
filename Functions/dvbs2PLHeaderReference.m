@@ -28,7 +28,7 @@ function refHeader = dvbs2PLHeaderReference(phyParams)
 %   THE PLS CODE PACKS AS  MODCOD*4 + short*2 + pilots  (ETSI EN 302
 %   307-1 5.5.2.2), so the MODCOD index recovered here is floor(PLS/4).
 %   Verified against the hardware logs: PLS 5/17/29/41/45 correspond to
-%   S1's reported MODCOD 1/4/7/10/11.
+%   S1a's reported MODCOD 1/4/7/10/11.
 
     % A run uses only a handful of distinct PLS codes -- typically one per
     % ACM rung -- so building each reference once and reusing it keeps

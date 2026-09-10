@@ -22,7 +22,7 @@
 %   eventually runs dry (an underrun).
 %
 %   The transmit block here is one real MODCOD-1 normal PLFRAME rather than
-%   a round number, so the result maps straight onto what S1 actually sends.
+%   a round number, so the result maps straight onto what S1a actually sends.
 %
 %   RF SAFETY: transmitting and receiving on the SAME radio couples the
 %   transmitter directly into its own front end. txGain is pinned to 0. Run

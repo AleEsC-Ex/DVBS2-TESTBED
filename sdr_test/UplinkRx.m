@@ -100,10 +100,10 @@ firstDecode = false;
 runTic = tic;
 lastReport = tic;
 
-% Same split S1 uses, so the two are directly comparable. The number that
-% matters is MS PER READ: in the integrated system S1 measured 32.6 ms per
+% Same split S1a uses, so the two are directly comparable. The number that
+% matters is MS PER READ: in the integrated system S1a measured 32.6 ms per
 % 8192-sample read while S2a's much larger reads cost 2.9 ms. If reads are
-% cheap HERE, where nothing else competes for the radio, then the cost in S1
+% cheap HERE, where nothing else competes for the radio, then the cost in S1a
 % comes from sharing one USRP with a transmit stream. If they are expensive
 % here too, it is inherent to the read and the uplink receiver cannot live in
 % a process that also has a real-time deadline.

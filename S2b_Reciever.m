@@ -1,4 +1,4 @@
-%S2_RECIEVER DVB-S2 receiver: acquisition through symbol/phase correction, SNR/RSSI, hand-off.
+%S2B_RECIEVER DVB-S2 receiver: acquisition through symbol/phase correction, SNR/RSSI, hand-off.
 %
 %   Receives front-end-processed samples over TCP from
 %   S2a_RFAcquisition.m, which owns acquisition (the USRP when
@@ -37,7 +37,7 @@
 %
 %   In SDR mode, a run of config.calibLockFramesRequired CONSECUTIVE
 %   successfully decoded frames is treated as link-establishment proof
-%   (S1_Transmitter.m sends calibration bursts until it hears back)
+%   (S1a_Transmitter.m sends calibration bursts until it hears back)
 %   rather than real data: none of them are ever forwarded to S3, and
 %   the feedback for the final one is sent immediately instead of
 %   waiting for the normal throttled cadence.
@@ -93,7 +93,7 @@ resyncResetChunks = 50;
 % it clears, rather than one per chunk for the whole episode.
 syncLostLockStreak = 0;
 
-% PLHEADERs thrown out by dvbs2FrameAcceptable because S1 could not have
+% PLHEADERs thrown out by dvbs2FrameAcceptable because S1a could not have
 % transmitted them. Worth watching as a rate rather than a total: a few
 % per run is the Reed-Muller decoder losing to noise, which is the point;
 % a steady stream means the two ends disagree about what is being sent.
@@ -101,7 +101,7 @@ rejectCount = 0;
 
 % Frames where the pilot and PLHEADER SNR estimates disagreed by more than
 % config.snr.maxDisagreementDB. Each one is a frame whose pilot-based
-% number would previously have gone to S1's ACM policy unchallenged.
+% number would previously have gone to S1a's ACM policy unchallenged.
 snrDisagreeCount = 0;
 
 % Run totals for the final summary. A 2-minute run scrolls hundreds of
@@ -118,7 +118,7 @@ residPhaseLog  = [];
 hdrResidLog    = [];
 syncRunawayCount = 0;
 
-% Dummy PLFRAMEs seen. These are deliberate filler from S1, not errors --
+% Dummy PLFRAMEs seen. These are deliberate filler from S1a, not errors --
 % they mean the carrier is up but that frame carried no data. Counted rather
 % than warned about, since at the top of the ACM ladder there can be
 % hundreds per run.
@@ -131,18 +131,18 @@ dummyCount = 0;
 % CFO stage. Keeping acquisition in its own process is what lets the
 % USRP's host-side buffer be drained promptly, rather than coupling
 % radioRx()'s cadence to how long a chunk's DSP takes here.
-fprintf('S2: opening RF acquisition server on port %d, waiting for S2a to connect ...\n', ...
+fprintf('S2b: opening RF acquisition server on port %d, waiting for S2a to connect ...\n', ...
     config.rfAcqPort);
-acqServer = dvbs2TCPServerRetry(config.rfAcqHost, config.rfAcqPort, "S2's RF acquisition server");
+acqServer = dvbs2TCPServerRetry(config.rfAcqHost, config.rfAcqPort, "S2b's RF acquisition server");
 while ~acqServer.Connected
     pause(0.1);
 end
-fprintf('S2: S2a connected.\n');
+fprintf('S2b: S2a connected.\n');
 
 %% Feedback client, connecting to the transmitter's ACM feedback server
-fprintf('S2: connecting to S1''s ACM feedback server ...\n');
-feedbackClient = dvbs2TCPConnectRetry(config.feedbackHost, config.feedbackPort, "S1's feedback server");
-fprintf('S2: connected to S1.\n');
+fprintf('S2b: connecting to S1a''s ACM feedback server ...\n');
+feedbackClient = dvbs2TCPConnectRetry(config.feedbackHost, config.feedbackPort, "S1a's feedback server");
+fprintf('S2b: connected to S1a.\n');
 
 %% Frame hand-off client, connecting to the processing unit's frame server
 % CONNECT DURING INITIALISATION, IN BOTH MODES.
@@ -165,9 +165,9 @@ fprintf('S2: connected to S1.\n');
 % the PHY link, and no frame is written to S3 before that. S3 would discard
 % anything arriving earlier anyway, so this keeps that traffic off the wire
 % rather than relying on the far end to throw it away.
-fprintf('S2: connecting to S3''s frame server ...\n');
+fprintf('S2b: connecting to S3''s frame server ...\n');
 frameClient = dvbs2TCPConnectRetry(config.frameHost, config.framePort, "S3's frame server");
-fprintf('S2: connected to S3.\n');
+fprintf('S2b: connected to S3.\n');
 linkEstablished = ~config.useSDR;
 
 %% Buffer initialization
@@ -189,7 +189,7 @@ cfoState = [];         % dvbs2CFOTracker state; [] until the first measurement i
 % from a 2 us fallback, which then poisons every later prediction.
 prevFrameLenSym = 33282;
 
-fprintf('\nS2: starting receive loop ...\n');
+fprintf('\nS2b: starting receive loop ...\n');
 
 % Real-time accounting: airtimeSec is how many seconds of RF this process
 % has processed, wall-clock is how long that took. Their ratio is the
@@ -197,6 +197,11 @@ fprintf('\nS2: starting receive loop ...\n');
 % is applying backpressure all the way up to the radio.
 runTic = tic;
 airtimeSec = 0;
+
+% Set when the inner chunk-wait loop below detects S2a's connection has
+% actually closed -- lets the top-of-loop guard stop immediately rather
+% than waiting out the rest of runDurationSec on a dead link.
+forceStop = false;
 
 % Deliberately not gated on config.maxFrames: the transmitter only
 % treats that as a NEW-DATA budget and keeps running afterward to
@@ -210,8 +215,8 @@ airtimeSec = 0;
 while true
 
     %% Stop after config.runDurationSec so all four scripts end together
-    if toc(runTic) >= config.runDurationSec
-        fprintf('\n=== S2 PROFILE === %.1f s wall | %.1f s airtime | RT factor %.3f\n', ...
+    if forceStop || toc(runTic) >= config.runDurationSec
+        fprintf('\n=== S2b PROFILE === %.1f s wall | %.1f s airtime | RT factor %.3f\n', ...
             toc(runTic), airtimeSec, toc(runTic)/max(airtimeSec,eps));
         fprintf('  chunks %d | frames decoded %d (%.1f%% of chunks)\n', ...
             chunkNum, frameSeqNum, 100*frameSeqNum/max(chunkNum,1));
@@ -279,18 +284,38 @@ while true
         break;
     end
 
-    %% Acquire one chunk from S2a
+    %% Acquire one chunk from S2a, without blocking indefinitely
     % Already DC-blocked, power-measured and AGC'd there -- this arrives
     % as one framed message carrying the samples and their RSSI together
     % (see dvbs2SerializeAcqChunk.m for why that link is framed).
-    try
-        acqBytes = dvbs2TCPFrameRead(acqServer);
-    catch ME
-        if strcmp(ME.identifier, 'dvbs2TCPFrameRead:ConnectionClosed')
-            fprintf('S2: RF acquisition link closed by S2a; stopping.\n');
+    %
+    % NON-BLOCKING, WITH ITS OWN DURATION CHECK -- same fix, same reason,
+    % as S3's frame-read loop. A plain blocking dvbs2TCPFrameRead here can
+    % only be woken by a new chunk arriving or the socket actually
+    % throwing ConnectionClosed -- and neither is guaranteed once S2a has
+    % itself stopped: none of these scripts calls exit, so a finished
+    % script's MATLAB process just idles at the prompt with its sockets
+    % still open. That means "the connection closes" never actually
+    % happens, and without this fix the runDurationSec guard above is
+    % unreachable whenever S2a finishes first -- which, once the launcher
+    % starts everything together, is every run.
+    while true
+        acqBytes = dvbs2TCPFrameTryRead(acqServer);
+        if ~isempty(acqBytes)
             break;
         end
-        rethrow(ME);
+        if ~acqServer.Connected
+            fprintf('S2b: RF acquisition link closed by S2a; stopping.\n');
+            forceStop = true;
+            break;
+        end
+        if toc(runTic) >= config.runDurationSec
+            break;   % let the top-of-loop guard above print the profile and stop
+        end
+        pause(0.005);
+    end
+    if isempty(acqBytes)
+        continue;
     end
     % RSSI needs hardware-specific calibration to convert to dBm on real
     % USRPs; carried here as a relative dB figure. chunkFreqOffsetEst is
@@ -303,7 +328,7 @@ while true
 
     chunkNum = chunkNum + 1;
     airtimeSec = airtimeSec + numel(newSamples_cfocomp)/Fsamp;
-    fprintf('S2: chunk %d | RSSI=%.2f dB | rawCFO(S2a)=%.1f Hz | RT factor %.3f\n', ...
+    fprintf('S2b: chunk %d | RSSI=%.2f dB | rawCFO(S2a)=%.1f Hz | RT factor %.3f\n', ...
         chunkNum, rssiDB, chunkFreqOffsetEst, toc(runTic)/max(airtimeSec,eps));
 
     % Match filter & timing sync
@@ -320,18 +345,18 @@ while true
     % Deliberately NOT a `continue` -- the rest of the loop body still
     % needs to run so chunksSinceLock keeps counting and, more
     % importantly, so the ACM feedback heartbeat at the bottom keeps
-    % reaching S1 while the receiver is re-acquiring.
+    % reaching S1a while the receiver is re-acquiring.
     if syncLostLock
         if syncLostLockStreak == 0
             syncRunawayCount = syncRunawayCount + 1;
-            fprintf(['S2: timing loop ran away at chunk %d -- resetting Gardner, ' ...
+            fprintf(['S2b: timing loop ran away at chunk %d -- resetting Gardner, ' ...
                 'discarding %d buffered symbols.\n'], chunkNum, numel(rxBuffer));
         end
         syncLostLockStreak = syncLostLockStreak + 1;
         rxBuffer = [];
     else
         if syncLostLockStreak > 0
-            fprintf('S2: timing sync recovered after %d bad chunk(s).\n', ...
+            fprintf('S2b: timing sync recovered after %d bad chunk(s).\n', ...
                 syncLostLockStreak);
             syncLostLockStreak = 0;
         end
@@ -427,7 +452,7 @@ while true
         catch ME
             % This script runs indefinitely -- an uncaught exception
             % here must not crash the whole receiver over one bad frame.
-            warning('S2:HeaderDecodeFailed', 'PLHEADER decode threw: %s', ME.message);
+            warning('S2b:HeaderDecodeFailed', 'PLHEADER decode threw: %s', ME.message);
             rxBuffer(1:idx) = [];
             calibLockCount = 0;   % a bad decode breaks the consecutive-good-frame streak
             continue;
@@ -446,7 +471,7 @@ while true
             %
             % This branch used to warn and reset calibLockCount, on the
             % assumption that this testbed never transmits dummy frames, so
-            % seeing one could only mean the PLSC had misdecoded. S1 now
+            % seeing one could only mean the PLSC had misdecoded. S1a now
             % sends them deliberately: when the ACM ladder climbs past the
             % point where real PLFRAMEs can be generated in real time, the
             % shortfall is filled with dummies so the carrier stays
@@ -479,7 +504,7 @@ while true
 
         % PLAUSIBILITY REJECTION. Everything above this point only asks
         % whether the PLSC decoded to a STRUCTURALLY valid code. This asks
-        % the stronger question: could S1, as configured, have transmitted
+        % the stronger question: could S1a, as configured, have transmitted
         % it at all? A header describing no pilots, a short FECFRAME, or a
         % MODCOD outside acm.modcodSet is not a marginal frame to decode
         % carefully -- it is proof this decode is wrong, because the
@@ -499,7 +524,7 @@ while true
             % cannot); a trickle is the Reed-Muller decoder losing to
             % noise now and then, which is exactly what this catches.
             if rejectCount <= 5 || mod(rejectCount, 50) == 0
-                fprintf(['S2: frame rejected (%s) at chunk %d | PLS=%d ' ...
+                fprintf(['S2b: frame rejected (%s) at chunk %d | PLS=%d ' ...
                     'peak=%.4f PLHdrConf=%.3f | %d rejected so far\n'], ...
                     rejectReason, chunkNum, phyParams.PLSDecimalCode, peak, ...
                     phyParams.DecodeMeanDistance - phyParams.DecodeMinDistance, ...
@@ -518,7 +543,7 @@ while true
             % produces a nonsensical frame length -- same handling as
             % any other invalid header: skip this lock and keep
             % searching rather than feeding it forward.
-            warning('S2:InvalidFrameLength', ...
+            warning('S2b:InvalidFrameLength', ...
                 'PLSC decoded to an invalid/reserved code (PLS=%d, frameLength=%g); skipping.', ...
                 phyParams.PLSDecimalCode, frameLength);
             rxBuffer(1:idx) = [];
@@ -608,7 +633,7 @@ while true
             if isfield(phaseInfo, 'FitSlope')
                 residHz = phaseInfo.FitSlope * Fsym / (2*pi);
             end
-            fprintf(['S2: SNR sources disagree by %.1f dB at chunk %d ' ...
+            fprintf(['S2b: SNR sources disagree by %.1f dB at chunk %d ' ...
                 '(pilots %.2f, header %.2f) -- using header | ' ...
                 'block trend %+.3f dB/blk | residual %+.1f Hz | %d so far\n'], ...
                 snrInfo.DisagreementDB, chunkNum, snrInfo.PilotSNRdB, ...
@@ -631,18 +656,18 @@ while true
             % Require several CONSECUTIVE successfully-decoded
             % calibration frames (config.calibLockFramesRequired), not
             % just the first one, before reporting link establishment --
-            % a run of samples gives S1 a mean AND a spread to pick its
+            % a run of samples gives S1a a mean AND a spread to pick its
             % first real MODCOD from, rather than bootstrapping the whole
             % link off a single lucky/unlucky sample. Any decode failure
             % in between resets calibLockCount to 0 (see the reset sites
             % above), so this only fires after an unbroken run.
             calibLockCount = calibLockCount + 1;
             if calibLockCount < config.calibLockFramesRequired
-                fprintf('S2: calibration frame locked (%d/%d consecutive), SNR=%.2f dB -- waiting for a stable run before reporting link established\n', ...
+                fprintf('S2b: calibration frame locked (%d/%d consecutive), SNR=%.2f dB -- waiting for a stable run before reporting link established\n', ...
                     calibLockCount, config.calibLockFramesRequired, snrDB);
             else
                 % This can only be a real, successfully decoded run of
-                % calibration frames from S1 (see S1_Transmitter.m), so
+                % calibration frames from S1a (see S1a_Transmitter.m), so
                 % it proves the PHY link works. Its content is never
                 % forwarded to S3. Report feedback immediately rather
                 % than waiting for the normal throttled cadence, then
@@ -667,7 +692,7 @@ while true
                 % above); this only opens the VALVE. From here the else
                 % branch below starts writing frames to it.
                 linkEstablished = true;
-                fprintf(['S2: link established after %d consecutive calibration frames ' ...
+                fprintf(['S2b: link established after %d consecutive calibration frames ' ...
                     '(mean SNR=%.2f dB, sigma=%.2f dB) -- forwarding frames to S3 from now on.\n'], ...
                     config.calibLockFramesRequired, mean(calibSamples), std(calibSamples));
             end
@@ -695,7 +720,7 @@ while true
             else
                 cfoFlag = ' ';
             end
-            fprintf(['S2: frame %d | peak=%.4f | CFO meas=%+.1f trk=%+.1f miss=%+.1f%s Hz ' ...
+            fprintf(['S2b: frame %d | peak=%.4f | CFO meas=%+.1f trk=%+.1f miss=%+.1f%s Hz ' ...
                 '(rate %+.1f Hz/s) | SNR=%.2f dB | RSSI=%.2f dB | PLS=%d | PLHdrConf=%.3f\n'], ...
                 frameSeqNum, peak, totalMeasHz, totalTrackedHz, cfoState.LastMiss, cfoFlag, ...
                 cfoState.Fdot, snrDB, rssiDB, phyParams.PLSDecimalCode, plHeaderConfidence);
@@ -717,14 +742,14 @@ while true
     % to live inside the frame-decoded branch above, which meant a receiver
     % that decoded NOTHING said nothing at all -- including no heartbeat.
     % Measured on hardware: 36.84 s between reports against a configured 2.0,
-    % while S1's linkLossSec is 5.0. So S1 declared the return link dead
+    % while S1a's linkLossSec is 5.0. So S1a declared the return link dead
     % precisely when the forward link was failing and it most needed to know.
     % Worse, the one signal designed to carry exactly that condition --
     % Count = 0, "alive but decoded nothing" -- was unreachable, because
     % reaching it required decoding a frame.
     %
     % Only after link establishment. Before that the calibration branch above
-    % owns reporting, and a Count = 0 report arriving first would have S1
+    % owns reporting, and a Count = 0 report arriving first would have S1a
     % establish the link on a mean SNR of zero.
     if linkEstablished
         [batchMean, batchSigma] = localBatchStats(snrBatch, config);
@@ -735,7 +760,7 @@ while true
         % otherwise perfect frames -- measured: peak 0.988, PLHdrConf 2.5,
         % correct PLS, SNR = -3.14 dB against a true 16.5 dB. A single such
         % frame satisfies "the mean moved", reports itself immediately, and
-        % reaches the policy as a genuine sample. It shows up in S1's log as
+        % reaches the policy as a genuine sample. It shows up in S1a's log as
         % "mean 6.50 sigma 9.75" where the real spread is 0.3-0.5 dB -- and
         % since the MODCOD bound is mu - k*sigma, one bad estimate suppresses
         % the whole ladder. config.acm.outlierMADs is meant to catch this, but
@@ -766,7 +791,7 @@ while true
             elseif feedback.Count == 0, why = 'heartbeat, DECODED NOTHING';
             else,                why = 'heartbeat';
             end
-            fprintf('S2: feedback sent (%s) | %d frames | mean %.2f sigma %.2f dB | %.2f s since last\n', ...
+            fprintf('S2b: feedback sent (%s) | %d frames | mean %.2f sigma %.2f dB | %.2f s since last\n', ...
                 why, feedback.Count, batchMean, batchSigma, sinceLast);
 
             lastSentMean = batchMean;
@@ -781,7 +806,7 @@ while true
     else
         chunksSinceLock = chunksSinceLock + 1;
         if chunksSinceLock >= resyncResetChunks
-            fprintf('S2: no frame found in %d chunks -- resetting matched filter/timing sync.\n', ...
+            fprintf('S2b: no frame found in %d chunks -- resetting matched filter/timing sync.\n', ...
                 chunksSinceLock);
             clear dvbs2MatchedFilterTimingSync;
             chunksSinceLock = 0;
@@ -789,7 +814,7 @@ while true
     end
 end
 
-fprintf('S2: stopping.\n');
+fprintf('S2b: stopping.\n');
 
 function [m, s] = localBatchStats(samples, config)
 %LOCALBATCHSTATS Mean and standard deviation of one batch, outliers removed.

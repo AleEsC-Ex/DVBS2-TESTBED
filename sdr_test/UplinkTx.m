@@ -15,8 +15,8 @@
 %   can check that the numbers survived the link, not merely that something
 %   arrived.
 %
-%   THIS IS A ONE-HOP BRING-UP TEST. Nothing else needs to be running: no S1,
-%   no S2, no downlink. That is the point -- in the integrated testbed the
+%   THIS IS A ONE-HOP BRING-UP TEST. Nothing else needs to be running: no S1a,
+%   no S2b, no downlink. That is the point -- in the integrated testbed the
 %   uplink only carries traffic once the receiver has locked the 2 GHz
 %   downlink, so a broken uplink and a broken downlink produce exactly the
 %   same symptom and cannot be told apart. Proving each RF hop on its own
@@ -24,7 +24,7 @@
 %
 %   Bring-up order:
 %     1. this script + UplinkRx.m          proves the 500 MHz path
-%     2. S1 + S2a + S2                     proves the 2 GHz path
+%     2. S1a + S2a + S2b                   proves the 2 GHz path
 %     3. all four                          only once both halves are proven
 %
 %   WATCH THE UNDERRUN COUNT. A burst transmitter could underrun harmlessly

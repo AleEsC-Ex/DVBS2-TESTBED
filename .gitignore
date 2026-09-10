@@ -41,3 +41,6 @@ codegen/
 
 # Claude Code local settings (machine-specific, not shared)
 .claude/settings.local.json
+
+# Per-run MATLAB console logs from Launch-DVBS2Testbed.ps1
+logs/

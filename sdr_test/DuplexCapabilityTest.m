@@ -18,7 +18,7 @@
 %   you can put a frame OR get a frame but not both. Running them
 %   sequentially in a loop is reported to give an exponentially
 %   increasing delay and eventually a USRP buffer overflow. If that
-%   happens here, the return link has to be time-division (S1 pauses
+%   happens here, the return link has to be time-division (S1a pauses
 %   transmitting to listen in a scheduled window) rather than
 %   frequency-division. So this script does not just check that the
 %   objects can be CREATED -- it measures whether the loop keeps up.

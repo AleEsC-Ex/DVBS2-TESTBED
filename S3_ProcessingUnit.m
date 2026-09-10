@@ -36,8 +36,8 @@ plHeaderSymbols = 90;   % PLHEADER length in symbols, fixed by the DVB-S2 standa
 % RUN CLOCK, STARTED HERE RATHER THAN AFTER THE CONNECTIONS.
 %
 % The other three scripts start their clock once their upstream is attached,
-% and for them that happens almost immediately: S2a connects to S2 as soon
-% as S2's server is listening. S3 is different -- S2 only connects to S3
+% and for them that happens almost immediately: S2a connects to S2b as soon
+% as S2b's server is listening. S3 is different -- S2b only connects to S3
 % AFTER link establishment, which has taken anywhere from 7 to 100 chunks
 % across the runs in this project. Starting the clock there meant S3's
 % 120 s began tens of seconds after everyone else's and it stopped long
@@ -47,38 +47,38 @@ plHeaderSymbols = 90;   % PLHEADER length in symbols, fixed by the DVB-S2 standa
 runTicS3 = tic;
 
 %% Frame hand-off server (this processing unit is the TCP server; the receiver connects as client)
-fprintf('S3: opening frame server on port %d, waiting for S2 to connect ...\n', config.framePort);
+fprintf('S3: opening frame server on port %d, waiting for S2b to connect ...\n', config.framePort);
 frameServer = dvbs2TCPServerRetry(config.frameHost, config.framePort, "S3's frame server");
-% Bounded wait. Without this S3 blocks here forever when S2 never
+% Bounded wait. Without this S3 blocks here forever when S2b never
 % establishes the link -- and because the wait sits BEFORE the main loop,
 % the duration guard inside that loop is never reached. That is the case
 % where S3 appears to ignore runDurationSec entirely.
 while ~frameServer.Connected
     if toc(runTicS3) >= config.runDurationSec
-        fprintf(['S3: S2 never connected within %g s -- no frames to process.\n' ...
-            '    (S2 only connects once it has established the link; check S2''s log.)\n'], ...
+        fprintf(['S3: S2b never connected within %g s -- no frames to process.\n' ...
+            '    (S2b only connects once it has established the link; check S2b''s log.)\n'], ...
             config.runDurationSec);
         return;
     end
     pause(0.1);
 end
-fprintf('S3: S2 connected.\n');
+fprintf('S3: S2b connected.\n');
 
 %% Retransmit-request client, connecting to the transmitter's retransmit-request server
 % Selective-repeat ARQ: sends a request whenever this script detects a
 % gap in the packet sequence or a packet's own CRC-8 fails. Independent
 % of the frame link above.
 % WHO ACTUALLY HOSTS THIS PORT DEPENDS ON THE RETURN-LINK MODE, and the
-% message has to say so. It used to read "connecting to S1" unconditionally,
-% which was written when S1 hosted the port directly over TCP and never
+% message has to say so. It used to read "connecting to S1a" unconditionally,
+% which was written when S1a hosted the port directly over TCP and never
 % updated when S2a took it over for the RF uplink. That stale string sent an
 % entire debugging session looking at the wrong process.
 %
-%   RF uplink   S2a hosts it and relays what arrives over 500 MHz to S1
-%   TCP         S1 hosts it itself, as it always did
-retransmitHostName = "S1";
+%   RF uplink   S2a hosts it and relays what arrives over 500 MHz to S1a
+%   TCP         S1a hosts it itself, as it always did
+retransmitHostName = "S1a";
 if config.useSDR && config.uplink.useRF
-    retransmitHostName = "S2a (relayed to S1 over the RF uplink)";
+    retransmitHostName = "S2a (relayed to S1a over the RF uplink)";
 end
 fprintf('S3: connecting to %s''s retransmit-request server on port %d ...\n', ...
     retransmitHostName, config.retransmitPort);
@@ -91,8 +91,8 @@ framesReceived = 0;
 framesLost = 0;
 
 % LINK STATE, NOW THAT AN OPEN SOCKET NO LONGER MEANS AN ESTABLISHED LINK.
-% S2 connects during its own initialisation rather than after acquisition,
-% so frameServer.Connected goes true almost immediately -- while S2 is
+% S2b connects during its own initialisation rather than after acquisition,
+% so frameServer.Connected goes true almost immediately -- while S2b is
 % still running its calibration frames and deliberately sending nothing.
 % The first frame to arrive is therefore the link-established signal, and
 % nothing in the processing loop runs before it.
@@ -173,20 +173,20 @@ while true
 
     %% Wait for the next PLFRAME, but not forever
     %
-    % This used to be a straight blocking read, ended only by S2 closing the
+    % This used to be a straight blocking read, ended only by S2b closing the
     % socket. When that close is not detected -- which is what happened on
     % the 120 s run -- S3 waits indefinitely and its profile is never
     % printed, so the whole run produces no report from the one process that
     % knows whether the PAYLOAD survived.
     %
     % Polling instead lets the duration guard actually fire. The grace
-    % period exists because S3 sits at the end of the chain: S2 may still be
+    % period exists because S3 sits at the end of the chain: S2b may still be
     % draining frames it decoded before its own clock ran out, and cutting
     % S3 off at exactly runDurationSec would discard them.
     % dvbs2TCPFrameTryRead returns [] rather than raising on a closed
     % connection, so the disconnect is detected from the server object
     % instead -- and only after a try-read comes back empty, so any frames
-    % still buffered when S2 closed are drained first.
+    % still buffered when S2b closed are drained first.
     s3Stop = false;
     while true
         plBytes = dvbs2TCPFrameTryRead(frameServer);
@@ -194,7 +194,7 @@ while true
             break;
         end
         if ~frameServer.Connected
-            fprintf('S3: S2 disconnected (finished or stopped); ending processing loop.\n');
+            fprintf('S3: S2b disconnected (finished or stopped); ending processing loop.\n');
             s3Stop = true;
             break;
         end
@@ -209,7 +209,7 @@ while true
         break;
     end
 
-    % A frame arrived, so S2 has opened its valve and the PHY link is up.
+    % A frame arrived, so S2b has opened its valve and the PHY link is up.
     % Everything below this point -- decoding, BER/PER accounting, gap
     % detection and ARQ -- is gated behind this, so none of it can run on
     % an idle-but-connected socket.
@@ -264,8 +264,16 @@ while true
         plsLost(plsIdx) = plsLost(plsIdx) + 1;
         framesLost = framesLost + 1;
         lostFrameSeqNums(end+1) = frameSeqNum; %#ok<SAGROW>
-        fprintf('S3: frame %d -> LOST (physical layer / BBHEADER error). Frames lost so far: %d/%d\n', ...
-            frameSeqNum, framesLost, framesReceived);
+        % MODCOD included here, not just in the closing per-MODCOD table,
+        % so a lost frame is identifiable from THIS line alone -- no need
+        % to cross-reference the closing summary or S2b's own log by
+        % frameSeqNum just to find out what it was. Particularly useful
+        % for spotting a MODCOD S1a never actually transmitted, which is
+        % the signature of a PLSC misdecode rather than a genuine loss at
+        % that MODCOD (see dvbs2PLHeaderRecover.m).
+        fprintf(['S3: frame %d -> LOST (physical layer / BBHEADER error), ' ...
+            'PLS=%d (MODCOD %d). Frames lost so far: %d/%d\n'], ...
+            frameSeqNum, phyParams.PLSDecimalCode, floor(phyParams.PLSDecimalCode/4), framesLost, framesReceived);
         continue;
     end
 
@@ -407,11 +415,11 @@ end
 
 fprintf('\n=== S3 PROFILE === %.1f s wall | %d frames received, %d lost (%.1f%%)\n', ...
     toc(runTicS3), framesReceived, framesLost, 100*framesLost/max(framesReceived,1));
-% Acquisition cost, separated from processing time. The socket to S2 is now
+% Acquisition cost, separated from processing time. The socket to S2b is now
 % open from initialisation, so this is the genuine PHY acquisition delay
 % rather than a TCP connect time -- and it is dead time on S3's run clock.
 if isnan(linkEstablishedSec)
-    fprintf('  link: NEVER established -- socket connected but S2 sent no frames\n');
+    fprintf('  link: NEVER established -- socket connected but S2b sent no frames\n');
 else
     fprintf('  link: established %.1f s into the run (%.0f%% of the clock spent waiting)\n', ...
         linkEstablishedSec, 100*linkEstablishedSec/max(toc(runTicS3), eps));
@@ -421,8 +429,8 @@ fprintf('  BER %.3e over %d bits | PER %.3e over %d packets\n', ...
     1 - totalPacketsOK/max(totalPacketsSeen,1), totalPacketsSeen);
 
 % PER-MODCOD LOSS. The most useful line in this report, and the one the
-% other three scripts cannot produce: S2 knows which MODCOD it decoded and
-% S1 knows which it sent, but only here is it known whether the PAYLOAD
+% other three scripts cannot produce: S2b knows which MODCOD it decoded and
+% S1a knows which it sent, but only here is it known whether the PAYLOAD
 % survived. phyParams arrives with every frame including the ones that fail,
 % so a lost frame still carries the PLS code that produced it.
 %

@@ -32,14 +32,14 @@ config.useSDR = true;
 % Receiver -> transmitter ACM feedback. The receiver is always the
 % tcpclient; WHICH PROCESS HOSTS THE SERVER DEPENDS ON THE MODE:
 %
-%   useSDR = false  S1_Transmitter.m hosts it, and the report arrives
+%   useSDR = false  S1a_Transmitter.m hosts it, and the report arrives
 %                   straight over loopback.
 %   useSDR = true   S2a_RFAcquisition.m hosts it, modulates the report
 %                   (Functions/Return/) and transmits it on the 500 MHz
-%                   return link; S1 recovers it off the air.
+%                   return link; S1a recovers it off the air.
 %
 % Keeping the port and the client side identical in both modes is what lets
-% S2_Reciever.m and S3_ProcessingUnit.m stay completely unaware of which
+% S2b_Reciever.m and S3_ProcessingUnit.m stay completely unaware of which
 % way their messages travel -- they write the same bytes to the same
 % address either way.
 config.feedbackHost = '127.0.0.1';
@@ -52,11 +52,11 @@ config.framePort = 30002;
 
 % Transmitter -> RF acquisition process CLEAN transmitted samples: only
 % used when useSDR = false. S2a_RFAcquisition.m is the tcpserver,
-% S1_Transmitter.m is the tcpclient.
+% S1a_Transmitter.m is the tcpclient.
 %
-% S2a (not S1, and not S2) applies the simulated channel impairment
+% S2a (not S1a, and not S2b) applies the simulated channel impairment
 % model to these samples, mirroring the real-hardware split: in SDR mode
-% S1 hands its waveform to the radio and everything downstream of the
+% S1a hands its waveform to the radio and everything downstream of the
 % antenna belongs to the receiving side. Both modes therefore have the
 % same process topology, differing only in S2a's acquisition step.
 config.simChannelHost = '127.0.0.1';
@@ -64,15 +64,15 @@ config.simChannelPort = 30003;
 
 % Processing unit -> transmitter retransmit requests (selective-repeat
 % ARQ): the processing unit is the tcpclient, and as with the feedback
-% link above the server is S1 in sim mode and S2a in SDR mode, where the
+% link above the server is S1a in sim mode and S2a in SDR mode, where the
 % request goes out over the 500 MHz return link. Independent of the other
 % links -- the receiver is not involved in retransmission at all.
 config.retransmitHost = '127.0.0.1';
 config.retransmitPort = 30004;
 
 % RF acquisition process (S2a_RFAcquisition.m) -> receiver DSP process
-% (S2_Reciever.m): front-end-processed samples plus their RSSI, used in
-% BOTH modes. S2_Reciever.m is the tcpserver, S2a_RFAcquisition.m is the
+% (S2b_Reciever.m): front-end-processed samples plus their RSSI, used in
+% BOTH modes. S2b_Reciever.m is the tcpserver, S2a_RFAcquisition.m is the
 % tcpclient.
 %
 % Decoupling acquisition from the receiver's much heavier per-chunk DSP
@@ -80,8 +80,8 @@ config.retransmitPort = 30004;
 % regardless of DSP time, rather than coupling radioRx()'s cadence
 % directly to it. S2a also carries the per-sample front end (DC block,
 % RSSI, AGC) -- all streaming, chunk-boundary-safe stages that produce
-% identical results wherever they run, moved off S2 because S2a was
-% measured at roughly 1.5% of real time while S2 carries the bulk of the
+% identical results wherever they run, moved off S2b because S2a was
+% measured at roughly 1.5% of real time while S2b carries the bulk of the
 % pipeline's cost.
 %
 % Unlike the raw byte streams above, this link is message-framed
@@ -89,6 +89,53 @@ config.retransmitPort = 30004;
 % has to travel bound to the samples it was measured over.
 config.rfAcqHost = '127.0.0.1';
 config.rfAcqPort = 30005;
+
+% S1a (owns both radios, generates nothing) -> S1b (owns the waveform
+% generator, ACM control, AND uplink recovery): raw uplink samples, RF
+% mode only (config.uplink.useRF). S1a does no demodulation of its own --
+% it just drains radioUplinkRx() on the same pacing schedule it always
+% did, and forwards whatever comes back. S1b is the tcpserver (same
+% "processing side hosts" convention as S2b for S2a above), S1a the
+% tcpclient.
+%
+% No dedicated serialize/deserialize pair needed -- unlike
+% dvbs2SerializeAcqChunk.m's chunks, there is no RSSI or CFO estimate to
+% carry alongside these samples (S1a does none of that processing), so
+% this is just dvbs2ComplexToBytes.m/dvbs2BytesToComplex.m directly.
+config.uplinkAcqHost = '127.0.0.1';
+config.uplinkAcqPort = 30006;
+
+% S1b (generates) -> S1a (transmits): one ready-to-transmit waveform
+% block per message, config.tx.blockSamples complex samples, packed with
+% dvbs2ComplexToBytes.m -- same "no wrapper needed" reasoning as the link
+% above, just heavier (a few MB per message instead of a few bytes).
+%
+% S1a IS THE TCPSERVER HERE, not S1b -- the reverse of the link above,
+% and deliberately so: S1a is the side that always needs to be listening
+% regardless of when S1b is ready, since it has nothing else to transmit
+% while it waits.
+%
+% MODCOD is no longer a message that crosses this link at all. Earlier
+% revisions of this split kept generation in S1a and sent S1a a 1-byte
+% MODCOD decision instead -- that meant every ACM decision had to be
+% serialized, sent, and applied on the far end. Now that S1b owns
+% cfgDVBS2 directly, a decision is just a local reconfiguration; nothing
+% about it needs to leave this process. Likewise retransmit requests are
+% consumed HERE now, not forwarded to S1a: validating one needs
+% globalPktIdx, which used to live in S1a because that was where packets
+% were generated -- now that generation is here too, so is
+% globalPktIdx, and the validation that depends on it.
+%
+% THE PACING QUESTION THIS RAISES, AND HOW IT'S ANSWERED. Generation used
+% to be implicitly paced by radioTx() blocking in the same process --
+% remove that and there is nothing stopping this process from generating
+% (and sending) far faster than S1a can actually transmit. S1b paces
+% itself explicitly instead: one block, every
+% config.tx.blockSamples/config.usrp.sampleRate seconds of real
+% wall-clock time, by design rather than as a side effect this time. See
+% the pacing comment in S1b_ACMControl.m's main loop for the mechanism.
+config.txBlockHost = '127.0.0.1';
+config.txBlockPort = 30007;
 
 %% Shared data seed
 % Used by BOTH the transmitter (to generate the transmitted bit pattern)
@@ -156,10 +203,10 @@ config.simChannel.EsNodBEdge = 4;         % at the horizons
 config.simChannel.cfoPeakHz = 0;
 
 %% Burst / chunking parameters
-% SUPERSEDED by config.tx.blockSamples. S1 no longer transmits a fixed
+% SUPERSEDED by config.tx.blockSamples. S1a no longer transmits a fixed
 % number of FRAMES per iteration -- it generates however many are needed to
 % cover one fixed-size radio block, which is 4 at QPSK (what this used to
-% be) and 6 at 8PSK. See localFramesPerBurst in S1_Transmitter.m.
+% be) and 6 at 8PSK. See localFramesPerBurst in S1a_Transmitter.m.
 %
 % Left here because the original reasoning is worth keeping: burstFrames had
 % to stay small so a MODCOD switch landed promptly rather than waiting out
@@ -167,7 +214,7 @@ config.simChannel.cfoPeakHz = 0;
 % any frame boundary, since the radio never sees the frame length at all.
 config.burstFrames = 4;   % retained for reference only; nothing reads it
 % comm.SDRuReceiver's SamplesPerFrame, used only by S2a_RFAcquisition.m
-% (config.useSDR) or directly by S2_Reciever.m's simulated-channel read
+% (config.useSDR) or directly by S2b_Reciever.m's simulated-channel read
 % size (~useSDR). Its output is always SamplesPerFrame long, zero-padded
 % past whatever it actually captures before the host stops draining the
 % radio's buffer in time -- requesting far more than that leaves most of
@@ -177,7 +224,7 @@ config.burstFrames = 4;   % retained for reference only; nothing reads it
 % with margin below it so chunks come back fully valid rather than
 % truncated.
 config.chunkLength = floor(66564/2);
-% Samples S2_Reciever.m's DSP loop reads per iteration from the RF
+% Samples S2b_Reciever.m's DSP loop reads per iteration from the RF
 % acquisition stream (config.useSDR only) -- deliberately decoupled from
 % config.chunkLength above (which sizes the acquisition process's own
 % USRP-facing chunk) so it can be sized for DSP efficiency instead:
@@ -269,11 +316,11 @@ config.rfAcqReadChunkLength = 66564;
 % MASTER SWITCH for closing the loop over the air.
 %
 %   true   S2a hosts the ACM-feedback and retransmit-request servers, and
-%          relays whatever arrives on them over the 500 MHz RF uplink. S1
-%          recovers the messages off the air. S2 and S3 are UNCHANGED --
+%          relays whatever arrives on them over the 500 MHz RF uplink. S1a
+%          recovers the messages off the air. S2b and S3 are UNCHANGED --
 %          they still connect to config.feedbackHost/.retransmitHost and
 %          have no idea which way their bytes travel.
-%   false  S1 hosts those servers itself and the messages stay on TCP
+%   false  S1a hosts those servers itself and the messages stay on TCP
 %          loopback, exactly as before the uplink existed.
 %
 % Keep this as the first thing to flip when the integrated system
@@ -284,7 +331,7 @@ config.uplink.useRF = true;
 config.uplink.centerFrequency = 500e6;
 
 % Which radio does which end. Matches the eventual integration: S2a (the
-% receiving side, on the 2922) transmits the uplink, S1 (on the 2920)
+% receiving side, on the 2922) transmits the uplink, S1a (on the 2920)
 % receives it. Swap these to test the other direction.
 config.uplink.txIPAddress = config.usrp.rxIPAddress;   % 2922 transmits the uplink
 config.uplink.rxIPAddress = config.usrp.txIPAddress;   % 2920 receives it
@@ -617,7 +664,7 @@ config.uplink.beaconPeriodSec = 1.0;
 % ends and is what the hardware supports.
 %
 % A BETTER STATISTIC IS AVAILABLE and not yet used as a gate: PLHdrConf
-% (S2_Reciever.m) separates real from false by a factor of forty, against
+% (S2b_Reciever.m) separates real from false by a factor of forty, against
 % this metric's factor of 1.6. Worth adopting if 0.80 still proves noisy.
 config.frameSyncPeakThreshold = 0.7;
 
@@ -636,7 +683,7 @@ config.rawCFOResolutionHz = 100;
 
 % DISABLED ON THE BENCH. S2a's blind coarse CFO stage
 % (dvbs2RawCFOCompensate.m) is switched off; cfoEstHz is reported as 0 and
-% the samples pass through un-rotated. S2 needs no change -- it adds the two
+% the samples pass through un-rotated. S2b needs no change -- it adds the two
 % estimates and subtracts S2a's back out, so a zero simply means the
 % SOF-based estimator measures the whole offset and the tracker applies all
 % of it.
@@ -645,7 +692,7 @@ config.rawCFOResolutionHz = 100;
 % problems that only matter once you leave the bench:
 %
 %   1. IT NEEDS TO KNOW THE MODULATION. S2a hardcodes "QPSK" because the
-%      MODCOD lives in the PLHEADER, which is decoded downstream in S2 --
+%      MODCOD lives in the PLHEADER, which is decoded downstream in S2b --
 %      a circular dependency S2a cannot resolve. Raising 8PSK to the 4th
 %      power leaves BPSK, not a tone; 16APSK collapses under no power at
 %      all. It is correct today only because modcodSet is capped at QPSK.
@@ -653,7 +700,7 @@ config.rawCFOResolutionHz = 100;
 %      +-83 333 Hz, and a noise peak landing near that edge produces a
 %      wild estimate. Measured: chunk 233 read -1546 Hz, chunk 234 read
 %      +81787 Hz. S2a then de-rotated that chunk by 81.8 kHz, which
-%      unlocked S2's Gardner loop, and S2 never recovered -- 120 frames
+%      unlocked S2b's Gardner loop, and S2b never recovered -- 120 frames
 %      decoded perfectly, then nothing for the rest of the run. Every bad
 %      value in the logs sits within a few kHz of +-83 333.
 %
@@ -671,7 +718,7 @@ config.rawCFOResolutionHz = 100;
 % pulse shape's symmetry and never look at the constellation.
 config.rawCFOEnabled = false;
 
-% Closed-loop CFO tracking in S2 (see Functions/dvbs2CFOTracker.m). The
+% Closed-loop CFO tracking in S2b (see Functions/dvbs2CFOTracker.m). The
 % per-frame SOF estimate is a single-shot measurement from only 26
 % symbols, so it is noisy; the true offset is two crystals drifting and
 % is far more stable than the measurements of it. Tracking therefore buys
@@ -726,16 +773,16 @@ config.cfoTrack.maxConsecRejects = 5;
 % unchanged, so comm.SDRuTransmitter keeps its locked input size and the
 % radio session stays open. CROSSING one changes the sample count, which
 % forces release() and a full UHD re-negotiation: measured at 6.5 SECONDS of
-% dead carrier, after which S1 declares the return link lost, drops to
+% dead carrier, after which S1a declares the return link lost, drops to
 % MODCOD 1, resizes AGAIN, and the run does not recover. Confirmed by the
 % length ratio in the log, 266276/177572 = 1.4996 = exactly 3/2, the
 % bits-per-symbol ratio between 8PSK and QPSK.
 %
-% RESOLVED. S1 no longer hands the radio whole PLFRAMEs. Generated samples
+% RESOLVED. S1a no longer hands the radio whole PLFRAMEs. Generated samples
 % go into a queue and the radio is always given exactly
 % config.tx.blockSamples from the front of it, so the MODCOD can change on
 % any frame boundary and comm.SDRuTransmitter never sees the frame length at
-% all. Frames land wherever they land inside a block, which S2 does not care
+% all. Frames land wherever they land inside a block, which S2b does not care
 % about -- it searches for the SOF and buffers across chunk boundaries, so
 % it never assumed frame alignment.
 %
@@ -749,10 +796,10 @@ config.cfoTrack.maxConsecRejects = 5;
 % 1:28 = the full legacy DVB-S2 ladder: QPSK (1-11), 8PSK (12-17),
 % 16APSK (18-23), 32APSK (24-28). 8PSK 2/3 was confirmed working end to end
 % on hardware -- S3 recovered 28 of 28 packets per frame at PLS=53 -- so the
-% remaining question is not whether the radio copes but whether S1 can
+% remaining question is not whether the radio copes but whether S1a can
 % GENERATE fast enough.
 %
-% WATCH THE WAVEFORM-GENERATION SHARE IN S1'S PROFILE. LDPC encoding costs
+% WATCH THE WAVEFORM-GENERATION SHARE IN S1a'S PROFILE. LDPC encoding costs
 % the same per frame at any MODCOD (always 64800 bits), but a denser frame
 % occupies LESS airtime, so the duty cycle climbs as the ladder is climbed:
 %
@@ -761,8 +808,8 @@ config.cfoTrack.maxConsecRejects = 5;
 %   16APSK  50.1 ms                 ~22 ms               44%
 %   32APSK  40.0 ms                 ~22 ms               55%
 %
-% S1 measured 18.6% at RT 1.198 on the 8PSK run. If the profile shows that
-% share approaching ~50% at the top of the ladder, S1 cannot keep the
+% S1a measured 18.6% at RT 1.198 on the 8PSK run. If the profile shows that
+% share approaching ~50% at the top of the ladder, S1a cannot keep the
 % transmit FIFO fed and the fix is cheap dummy PLFRAMEs as filler (no LDPC
 % encode needed), not a narrower modcodSet.
 config.acm.modcodSet = 1:28;
@@ -770,7 +817,7 @@ config.acm.modcodSet = 1:28;
 % Largest move along the ladder a single ACM decision may make, in RUNGS
 % (positions in modcodSet, not raw MODCOD numbers).
 %
-% WHY A CAP AT ALL. Every MODCOD change forces S1 to release and reopen the
+% WHY A CAP AT ALL. Every MODCOD change forces S1a to release and reopen the
 % radio, because comm.SDRuTransmitter locks its input length and the
 % waveform length changes with the MODCOD -- visible in the log as
 % "waveform length 266276 -> 106724 samples; releasing radio to resize".
@@ -800,7 +847,7 @@ config.acm.maxJumpRungs = 3;
 % QPSK-only link. Confidence weighting cannot catch these -- the wrong
 % codeword was decoded confidently.
 %
-% What can catch them is that S2 already knows what S1 is permitted to
+% What can catch them is that S2b already knows what S1a is permitted to
 % transmit. Each flag below asserts one such agreement.
 %
 % NONE OF THESE DESCRIBE ANYTHING DVB-S2 FORBIDS. They describe what this
@@ -817,7 +864,7 @@ config.acm.maxJumpRungs = 3;
 %                         trustworthy first. dvbs2SNREstimate's fallback
 %                         still measures against a hardcoded QPSK
 %                         constellation, so it is wrong for 8PSK and above.
-%   requireNormalFrame  - needs S1 to actually build short FECFRAMEs, and
+%   requireNormalFrame  - needs S1a to actually build short FECFRAMEs, and
 %                         the short-frame LDPC tables wired up.
 config.rxReject.requirePilots      = true;
 config.rxReject.requireNormalFrame = true;
@@ -842,11 +889,11 @@ config.rxReject.restrictToModcodSet = true;
 % When they agree the pilot value is reported, because it is the more
 % precise. When they disagree the header value is reported, because a
 % +-0.44 dB estimate beats a -17 dB bias. Either way the frame is still
-% sent to S1 as a raw sample -- S2 does not smooth, and this is a
+% sent to S1a as a raw sample -- S2b does not smooth, and this is a
 % correction of the reference, not of the distribution.
 config.snr.maxDisagreementDB = 3;
 
-% FIXED RADIO BLOCK SIZE (S1_Transmitter.m's transmit FIFO).
+% FIXED RADIO BLOCK SIZE (S1a_Transmitter.m's transmit FIFO).
 %
 % comm.SDRuTransmitter locks its input length on the first call; changing it
 % needs release(), which tears down the UHD session for ~6.5 s. A DVB-S2
@@ -860,9 +907,9 @@ config.snr.maxDisagreementDB = 3;
 % (33282-16686)/3330 = 4.98, (33282-13338)/3330 = 5.99. A common multiple of
 % the four frame lengths runs to minutes of airtime.
 %
-% So S1 queues generated samples and hands the radio exactly this many from
+% So S1a queues generated samples and hands the radio exactly this many from
 % the front, every time. Frames fall wherever they fall inside a block --
-% which costs nothing, because S2 hunts for the SOF and buffers across chunk
+% which costs nothing, because S2b hunts for the SOF and buffers across chunk
 % boundaries rather than assuming frame alignment.
 %
 % 266256 = 4 QPSK PLFRAMEs at 2 samples/symbol = 399.4 ms of airtime, which
@@ -871,7 +918,7 @@ config.snr.maxDisagreementDB = 3;
 % comparable with every run recorded so far.
 config.tx.blockSamples = 266256;
 
-% SHARE OF EACH BLOCK'S AIRTIME S1 MAY SPEND GENERATING REAL PLFRAMES.
+% SHARE OF EACH BLOCK'S AIRTIME S1a MAY SPEND GENERATING REAL PLFRAMES.
 % Whatever it cannot generate inside this budget is filled with dummy
 % PLFRAMEs instead (Functions/dvbs2DummyFiller.m).
 %
@@ -891,17 +938,71 @@ config.tx.blockSamples = 266256;
 % work, not reordering it. On the first full-ladder run this showed up as
 % TX underruns rising from 6/126 bursts to 97/274.
 %
-% WHERE 0.35 COMES FROM. Measured on that run: non-generation work was 62.9%
-% of wall at RT 1.100, i.e. 69% of airtime. Leaving RT at ~1.0 therefore
-% allows generation about 31% of airtime. 0.35 is a little above that, to
-% avoid inserting filler on QPSK (28%) where none is needed, while capping
-% 8PSK, 16APSK and 32APSK.
+% WHERE THIS NUMBER COMES FROM, AND WHY IT MOVED. The figure above (0.35)
+% was measured back when S1 was one process: non-generation work was 62.9%
+% of wall at RT 1.100 -- because that process also owned radioTx() AND
+% radioUplinkRx(), which together dominated its time. Splitting the radios
+% into S1a (Functions/Testbed's own architecture notes have the full
+% history) left THIS process, S1b_ACMControl.m, competing only with its own
+% uplink DSP -- not with any radio call at all. Measured after that split:
+% uplink DSP 15.0%, block send to S1a 5.8%, other overhead 14.6%, for
+% ~35.4% non-generation work -- against 0.35's old 62.9%. The old value was
+% capping generation at roughly the level that used to be NECESSARY
+% headroom, which is no longer needed: S1b's own profile showed 42.8% of
+% its time spent idle ("pacing wait"), and 16.1% dummy filler that
+% headroom could have covered instead.
 %
-% RAISE IT if S1's profile shows few underruns and you want more throughput;
-% LOWER IT if underruns persist. The trade is strictly throughput against
-% carrier continuity -- filler keeps the receiver's loops locked, it just
-% carries no data.
-config.tx.genBudgetFraction = 0.35;
+% 0.55 leaves meaningful slack rather than claiming the theoretical
+% maximum (~65%) outright -- uplink DSP time is bursty (it spikes on every
+% decode, not evenly spread), and pushing the budget to consume ALL
+% measured idle time would leave no margin for that burstiness before
+% generation itself starts missing its own pacing tick (see
+% genDeadlineMisses in S1b_ACMControl.m's profile -- already nonzero even
+% at 0.35, so some variability is inherent, not new).
+%
+% TESTED AT 0.55 ON HARDWARE AND REVERTED -- the idle-time argument above
+% was correct as far as it went, but incomplete: it treated the pacing
+% tick as a soft, forgiving budget, when the S1b->S1a link is actually
+% fully synchronous with no lookahead. S1a has no buffer ahead of
+% radioTx() any more (unlike the old single-process txFifo, which could
+% carry a small cushion); the moment S1b runs one tick long, S1a is
+% simply waiting with nothing to send. Measured going from 0.35 to 0.55:
+% dummy filler dropped 16.1% -> 5.4% as intended, but generation deadline
+% misses rose 7.2% -> 24.8% of blocks, which propagated straight through
+% to S1a (TX underruns 2.5% -> 11.0%, RX overruns 0 -> 12) and out to the
+% actual link (frame loss 11.8% -> 25.9%, more than doubled). The idle
+% time this budget was spending was not wasted -- it was the margin that
+% kept ticks landing close to their deadline.
+%
+% THE LOOKAHEAD BUFFER NOW EXISTS -- S1b_ACMControl.m generates one block
+% ahead (pendingBlock/pendingMeta in its main loop) instead of generating
+% and sending in the same tick, so an occasional slow tick is absorbed by
+% the queued block instead of stalling S1a's radioTx() directly. A
+% pending block is dropped rather than sent if the MODCOD/link-established
+% state moves on before it ships (blocksDropped in S1b's profile), and S1a
+% falls back to a locally-synthesized dummy PLFRAME (localDummyBlocksSent
+% in its own profile) on any tick S1b has nothing ready, rather than
+% waiting indefinitely.
+%
+% RETESTED AT 0.45 ON HARDWARE WITH THE PIPELINE, AND KEPT. Four
+% configurations measured back to back on the same hardware, MODCOD
+% climbing to 32APSK in every one (so all four are under comparably heavy
+% load): 0.35 no pipeline (16.1% filler, 7.2% gen-deadline misses, 2.5% TX
+% underruns, 11.8% frame loss); 0.55 no pipeline (5.4% filler, 24.8%
+% misses, 11.0% underruns, 25.9% loss -- the collapse this whole redesign
+% was for); 0.35 WITH pipeline (20.6% filler, 13.4% misses, 12.3%
+% underruns, 11.1% loss); 0.45 WITH pipeline (13.2% filler, 25.8% misses,
+% 14.0% underruns, 8.0% loss -- the best frame-loss figure of the four,
+% despite the worst internal misses/underruns numbers). The pattern holds
+% across all four: once a slow tick has the pending-block buffer to land
+% in instead of stalling S1a's radio directly, internal timing pressure
+% (misses, underruns, filler) stops translating into frame loss the way it
+% used to -- the stale-block drop and S1a's local-dummy fallback (both in
+% S1b_ACMControl.m / S1a_Transmitter.m) absorb it instead. 0.45 was not an
+% exhaustive search of the space above 0.35; it is one deliberate step
+% tested to confirm the pipeline actually buys back the headroom this
+% comment used to say only a lookahead buffer could.
+config.tx.genBudgetFraction = 0.45;
 % PLACEHOLDER quasi-error-free (QEF) Es/No operating points in dB, keyed
 % by MODCOD index, Normal FECFRAME (the commonly published ETSI EN 302
 % 307-1 Table 13 figures). VERIFY against the actual standard before
@@ -964,12 +1065,12 @@ config.acm.minDwellSecDown = 0;   % no minimum dwell time moving down
 % they ever crossed the wire.
 
 %% Link establishment (SDR mode only)
-% Number of CONSECUTIVE successfully-decoded calibration frames S2 must
+% Number of CONSECUTIVE successfully-decoded calibration frames S2b must
 % see before it reports link establishment (SNR + recommended starting
-% MODCOD) back to S1. Each additional frame further EMA-smooths
+% MODCOD) back to S1a. Each additional frame further EMA-smooths
 % snrSmoothedDB (config.acm.snrSmoothingAlpha above), so requiring
 % several consecutive clean decodes instead of just the very first one
-% gives S1 a materially more stable starting SNR estimate to pick its
+% gives S1a a materially more stable starting SNR estimate to pick its
 % first real MODCOD from, rather than bootstrapping the whole link off a
 % single lucky/unlucky sample. Any decode failure (lost lock, PLHEADER
 % exception, dummy frame, invalid frame length) resets the count -- only
@@ -1092,7 +1193,7 @@ config.maxFrames = Inf;
 % LOOP -- radio and server setup is not counted, so this is comparable
 % between runs however long the USRPs take to open. Inf runs until Ctrl+C.
 %
-% Set to 60 for a PROFILING RUN: all four scripts stop together and S1 prints
+% Set to 60 for a PROFILING RUN: all four scripts stop together and S1a prints
 % a breakdown of where its wall time actually went. That breakdown is the
 % only way to separate three explanations for a TX underrun that look
 % identical from the outside:
@@ -1113,12 +1214,12 @@ config.maxFrames = Inf;
 % the ladder before it ends. Two minutes gives the ACM loop room to walk up
 % through 8PSK and into the APSK rungs and settle there.
 %
-% NOTE ON READING THE PROFILES: S1 should be started first (it has the most
+% NOTE ON READING THE PROFILES: S1a should be started first (it has the most
 % to bring up: two UHD sessions before a single sample leaves), so it also
 % FINISHES first. Once it stops, S2a's RSSI drops to about -52 dB -- that is
 % the USRP's LO leakage with nothing being fed to it, not a fault. Expect a
-% tail of "DECODED NOTHING" heartbeats at the end of S2's log equal to
-% however long S1 was started ahead of the receivers.
+% tail of "DECODED NOTHING" heartbeats at the end of S2b's log equal to
+% however long S1a was started ahead of the receivers.
 config.runDurationSec = 120;
 
 end

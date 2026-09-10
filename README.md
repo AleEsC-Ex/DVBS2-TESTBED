@@ -35,8 +35,7 @@ the payload downlink at a rate UHF could never sustain.
 
 Mapped onto the five processes: **S1a/S1b are the CubeSat** — it
 transmits its DVB-S2 downlink at 2 GHz and receives commands on its UHF
-receiver at 500 MHz, both on the same physical radio (`192.168.10.2`),
-exactly as a real CubeSat with one S-band and one UHF antenna would.
+receiver at 500 MHz, both on the same physical radio (`192.168.10.2`).
 **S2a/S2b/S3 are the ground station** — it receives the S-band downlink
 and transmits back over UHF whatever the link needs to send up: ACM
 feedback (so the CubeSat knows what MODCOD the channel currently

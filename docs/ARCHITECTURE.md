@@ -1,9 +1,11 @@
 # DVB-S2 Satellite Testbed — Architecture & Function Map
 
-A working inventory of the four processes that make up the testbed's live signal
-chain, the fifth planned for the return-link control plane, and the functions
-each one calls — organised by role: downlink physical layer, uplink physical
-layer, TCP transport, message serialization, and testbed / ACM control.
+A working inventory of the five processes that make up the testbed's live signal
+chain and the functions each one calls — organised by role: downlink physical
+layer, uplink physical layer, TCP transport, message serialization, and
+testbed / ACM control. Sections 3 and 4 explain the two standards this
+testbed implements — DVB-S2 for the forward link, CCSDS Telecommand for the
+return link — and map each one directly onto the functions that implement it.
 
 **Platform:** MATLAB R2026a
 **Hardware:** NI USRP-2920 (downlink TX + uplink RX, `192.168.10.2`) · USRP-2922 (`192.168.10.3`)
@@ -13,7 +15,7 @@ layer, TCP transport, message serialization, and testbed / ACM control.
 ## 1 · System overview
 
 The testbed splits one DVB-S2 forward link and one CCSDS Telecommand return
-link across four MATLAB processes, each its own script, talking over TCP on
+link across five MATLAB processes, each its own script, talking over TCP on
 loopback. Splitting the chain this way means each process can be started
 independently, in any order, and — on the hardware runs — each maps onto a
 distinct piece of the RF path rather than one script trying to own both
@@ -23,65 +25,88 @@ The two radios are not symmetric. **USRP-2920** carries the downlink transmit
 chain at 2 GHz *and* the uplink receive chain at 500 MHz — the same physical
 device, the same IP address, `192.168.10.2` — because the ground station only
 has the one antenna feed on that side. **USRP-2922** is free-standing at
-`192.168.10.3`. That constraint is why the uplink receiver stays inside
-`S1_Transmitter.m` rather than living in its own process: nothing else is
-allowed to open that IP.
+`192.168.10.3`. That constraint is why both radios stay inside
+`S1a_Transmitter.m` rather than being split across two processes: nothing
+else is allowed to open that IP.
+
+Downlink generation and ACM control used to live in that same process too,
+until measurement showed the combination cost more than it saved (see
+[§9](#9--testbed--acm-control--functionstestbed)'s "how ACM works" section for
+the full history). `S1a_Transmitter.m` was pared back to radio I/O only —
+both radios, and nothing else — with everything that decides *what* to
+transmit split out into `S1b_ACMControl.m`: the waveform generator, the
+transmit FIFO, ACM policy, and the CCSDS uplink receive chain.
 
 ```mermaid
 flowchart LR
-    S1["S1 — Transmitter\n192.168.10.2"]
+    S1a["S1a — Transmitter\nboth radios, 192.168.10.2"]
+    S1b["S1b — ACM Control\ngeneration + ACM policy + uplink DSP"]
     S2a["S2a — RF Acquisition\nradio front end"]
-    S2["S2 — Receiver\ndownlink DSP"]
+    S2b["S2b — Receiver\ndownlink DSP"]
     S3["S3 — Processing Unit\nbit recovery + BER/PER"]
-    S1b["S1b (planned)\nACM policy + uplink upkeep"]
 
-    S1 -->|2 GHz RF| S2a
-    S2a -->|TCP :30005| S2
-    S2 -->|TCP :30002| S3
+    S1b -->|TCP :30007 TX blocks| S1a
+    S1a -->|2 GHz RF| S2a
+    S2a -->|TCP :30005| S2b
+    S2b -->|TCP :30002| S3
     S3 -.->|TCP :30004 ARQ retransmit| S2a
-    S2 -.->|TCP :30001 ACM feedback| S2a
-    S2a ==>|500 MHz RF, relayed| S1
-    S1 -.- S1b
-
-    classDef planned stroke-dasharray: 5 5,fill:transparent;
-    class S1b planned;
+    S2b -.->|TCP :30001 ACM feedback| S2a
+    S2a ==>|500 MHz RF, relayed| S1a
+    S1a -->|TCP :30006 raw uplink samples| S1b
 ```
 
-All four TCP ports are configured once, in `dvbs2TestbedConfig.m`, as
-`host:port` pairs. Which physical process binds a given port changes between
-simulated and hardware runs — in RF mode, S2a takes over the two ports S1
-used to host directly — but the scripts that connect to them never need to
-know that; see [§7](#7--testbed--acm-control--functionstestbed).
+All TCP ports are configured once, in `dvbs2TestbedConfig.m`, as `host:port`
+pairs. Which physical process binds a given port changes between simulated
+and hardware runs — in RF mode, S2a takes over the two ports S1b used to
+host directly — but the scripts that connect to them never need to know
+that; see [§9](#9--testbed--acm-control--functionstestbed).
 
 ---
 
 ## 2 · The processes
 
-Four scripts run today, one per MATLAB window, each started independently
-and in any order. A fifth is planned but not yet built.
+Five scripts run today, one per MATLAB window, each started independently
+and in any order — every TCP client in this testbed retries its connect
+until the corresponding server is up, so there is no required startup
+sequence.
 
-### `S1_Transmitter.m` — Downlink TX
-Builds PLFRAMEs from a synthetic packet stream under adaptive coding &
-modulation, queues them into a transmit FIFO, and drives the downlink USRP
-at 2 GHz. Owns MODCOD selection from the ACM feedback it receives, and
-services selective-repeat ARQ retransmit requests ahead of new data, without
-pausing the new-data budget.
-Ports: TX 2 GHz (`192.168.10.2`), RX 500 MHz (shared IP).
+### `S1a_Transmitter.m` — Radio I/O only
+Owns both radios — downlink TX at 2 GHz and uplink RX at 500 MHz — because
+they share one IP and physically cannot be split across two processes.
+Generates nothing of its own: every transmitted sample comes from S1b over
+the TX-block link, and every received uplink sample is forwarded to S1b
+unprocessed. If S1b doesn't have a block ready in time, S1a falls back to
+transmitting a locally-synthesized dummy PLFRAME rather than let the radio
+go silent (see [§9](#9--testbed--acm-control--functionstestbed)'s ACM
+write-up, point 7).
+Ports: TX 2 GHz / RX 500 MHz (`192.168.10.2`), server `:30007` (TX blocks
+in, from S1b), client `:30006`\* (raw uplink samples out, to S1b).
+
+### `S1b_ACMControl.m` — Waveform generation, ACM control, uplink recovery
+Owns everything S1a does not: the DVB-S2 waveform generator and transmit
+FIFO, ACM policy (MODCOD selection from feedback, applied locally — no
+network hop needed since generation lives here too), the selective-repeat
+ARQ retransmit queue, and — in RF mode — the whole CCSDS Telecommand uplink
+receive chain. Paces itself against wall-clock time explicitly, one block
+ahead of what it sends (see §9, point 7), since it no longer sits downstream
+of a blocking radio call to pace it implicitly.
+Ports: client `:30007` (TX blocks out, to S1a), server `:30006`\* (raw
+uplink samples in, from S1a), server `:30001`\*\*, server `:30004`\*\*.
 
 ### `S2a_RFAcquisition.m` — Downlink front end
 The only process that touches the receive radio. Runs DC-offset/AGC
-conditioning on the raw 2 GHz samples and forwards fixed-length chunks to S2
+conditioning on the raw 2 GHz samples and forwards fixed-length chunks to S2b
 for DSP. In hardware mode it also becomes the return-link gateway: it hosts
 the ACM-feedback and retransmit-request listeners and relays whatever
-arrives on them, verbatim, over the 500 MHz uplink carrier to S1.
-Ports: server `:30005`, server `:30001`\*, server `:30004`\*.
+arrives on them, verbatim, over the 500 MHz uplink carrier to S1a.
+Ports: server `:30005`, server `:30001`\*\*, server `:30004`\*\*.
 
-### `S2_Reciever.m` — Downlink DSP
+### `S2b_Reciever.m` — Downlink DSP
 The physical-layer receive chain: frame sync, matched filtering with Gardner
 timing recovery, coarse/fine CFO estimation, PLHEADER/PLSC recovery,
 pilot-aided phase compensation, per-frame SNR estimation, and the
 frame-acceptability screen. Hands off corrected PLFRAMEs to S3 and reports
-channel quality back toward S1.
+channel quality back toward S1b.
 Ports: client `:30001`, client `:30002`.
 
 ### `S3_ProcessingUnit.m` — Bit recovery
@@ -92,31 +117,186 @@ failures and drives the selective-repeat ARQ logic that requests their
 retransmission.
 Ports: server `:30002`, client `:30004`.
 
-### `S1b` *(planned, not yet implemented)*
-Proposed split-out of ACM policy management and part of the uplink
-control-plane housekeeping from S1, so the downlink generation loop stops
-competing with return-link bookkeeping on one process. S1 keeps sole
-ownership of the shared-IP radio — that part cannot move. Deferred pending
-confirmation the current single-process load needs it.
+\* In simulated (non-RF) mode there is no uplink radio to carry samples
+between S1a and S1b, so this pair of ports is not used at all — S1b hosts
+the ACM-feedback and retransmit-request listeners (`:30001`/`:30004`)
+directly instead, in the same role S2a takes over in RF mode.
 
-\* In simulated (non-RF) mode these two servers are hosted by S1 directly,
-and S2a's radio/relay code does not run at all.
+\*\* In simulated (non-RF) mode these two servers are hosted by S1b
+directly, and S2a's radio/relay code does not run at all.
 
 ---
 
-## 3 · Downlink functions — `Functions/*.m`
+## 3 · The DVB-S2 standard, and where it's implemented
 
-The forward-link DSP chain, called mainly from `S2_Reciever.m`: everything
+DVB-S2 (ETSI EN 302 307-1) is the physical-layer standard this testbed uses
+for the **forward link** — S1a to S2a/S2b/S3, 2 GHz. It defines how bits
+become a transmittable signal, and it is built to run under **adaptive
+coding and modulation (ACM)**: the transmitter can change modulation and
+code rate frame by frame to match the channel, without the receiver being
+told out of band — because every frame announces its own format inline.
+
+**The PLFRAME.** Every transmitted unit is one PLFRAME, built from three
+parts:
+
+```
+┌──────────────┬───────────────────────┬────────┬─────┬────────┐
+│   PLHEADER    │      XFECFRAME data    │ pilot  │ ... │ pilot  │
+│  90 symbols   │  (LDPC/BCH-coded bits, │ block  │     │ block  │
+│ 26 SOF+64 PLSC│   mapped to symbols)   │ 36 sym │     │ 36 sym │
+└──────────────┴───────────────────────┴────────┴─────┴────────┘
+```
+
+- **PLHEADER** — 90 π/2-BPSK symbols, sent in the clear (unscrambled), split
+  into a 26-symbol **SOF** (Start Of Frame — always the same pattern, what
+  the receiver correlates against to find the frame at all) and a
+  64-symbol **PLSC** (PL Signalling Code), a Reed-Muller codeword that
+  tells the receiver, before it has decoded a single data bit, exactly what
+  MODCOD, FEC length and pilot configuration to expect for the rest of the
+  frame.
+- **XFECFRAME** — the coded payload. One LDPC/BCH-coded block, fixed at
+  **64800 bits** (this testbed rejects the standard's alternate 16200-bit
+  "short" FECFRAME — see `dvbs2FrameAcceptable.m`), mapped onto the
+  constellation the PLSC just announced: 2 bits/symbol for QPSK, 3 for
+  8PSK, 4 for 16APSK, 5 for 32APSK.
+- **Pilot blocks** — optional 36-symbol known sequences inserted every 16
+  data slots (a slot = 90 symbols), used for carrier/phase tracking, absent
+  when `HasPilots = false`.
+
+Put together (`dvbs2FrameLength.m`), a complete PLFRAME is:
+
+| MODCOD family | XFECFRAME symbols | Pilot blocks | **Total PLFRAME (symbols)** |
+|---|---:|---:|---:|
+| QPSK   | 32400 | 22 | **33282** |
+| 8PSK   | 21600 | 14 | **22194** |
+| 16APSK | 16200 | 11 | **16686** |
+| 32APSK | 12960 |  8 | **13338** |
+
+Higher-order modulations pack the same 64800 coded bits into fewer symbols
+— that is literally what buys the throughput, at the cost of needing more
+SNR to place each symbol correctly.
+
+**Where each part of the standard is implemented.** This is the same chain
+as [§5](#5--downlink-functions--functionsm), organised by what it's doing
+rather than by filename:
+
+| Standard concept | Implemented by |
+|---|---|
+| Symbol timing recovery (matched filter + Gardner) | `dvbs2MatchedFilterTimingSync.m` |
+| Locating the PLHEADER in a stream of samples | `dvbs2FrameSync.m`, `dvbs2SOFReference.m` |
+| Coarse carrier-frequency acquisition | `dvbs2CoarseFreqEst.m`, `lrEstimate.m`, `dvbs2RawCFOCompensate.m` (currently disabled) |
+| Fine carrier-frequency tracking | `dvbs2FineFreqEst.m`, `dvbs2CFOTracker.m` |
+| PLSC decode → MODCOD / FEC length / pilots | `dvbs2PLHeaderRecover.m`, `dvbs2PLHeaderReference.m` |
+| Pilot-block generation & phase correction | `dvbs2PilotStructure.m`, `dvbs2PhaseCompensate.m` |
+| Phase correction when a frame has no pilots | `dvbs2NonPilotFineFreqPhase.m` |
+| PLFRAME length bookkeeping | `dvbs2FrameLength.m`, `getDFL.m` |
+| Per-frame SNR measurement (feeds ACM and LLR scaling) | `dvbs2SNREstimate.m` |
+| LDPC/BCH decode + BBHEADER/packet extraction | `AEC_dvbs2BitRecover.m` |
+| Rejecting frames the transmitter could not have sent | `dvbs2FrameAcceptable.m` *(temporary safety net, meant to be progressively relaxed)* |
+| Keeping the carrier alive between real bursts | `dvbs2DummyFiller.m` |
+| Simulated-channel testing only | `configureDVBS2Channel.m` |
+
+---
+
+## 4 · The CCSDS Telecommand standard, and where it's implemented
+
+The **return link** — S2b/S3 back to S1b, 500 MHz — carries ACM feedback and
+ARQ retransmit requests, not payload data, so it uses a different standard
+entirely: **CCSDS 231.0-B, TC Synchronization and Channel Coding**, the
+protocol real missions use for ground-to-spacecraft commanding.
+
+**PLOP-2** (Physical Layer Operations Procedure-2) is the standard's
+continuous-carrier mode — the carrier is never keyed off, so the receiver's
+carrier and timing loops never lose lock waiting for a message. Three
+things can be on the air at any moment:
+
+- **Acquisition sequence** — alternating symbols, sent once at session
+  start purely so the receiver's loops have something to lock onto.
+- **Idle sequence** — the same alternating pattern, sent whenever no
+  command is queued. This is what keeps the link "up" with nothing to say.
+- **CLTU** (Communications Link Transmission Unit) — start sequence +
+  coded codeblock + tail sequence: the thing that actually carries a
+  message.
+
+**Coding.** This testbed implements the **LDPC(128,64)** branch of the
+standard only (rate 1/2, 128-bit codeword carrying 64 information bits) —
+CCSDS also defines a BCH-coded mode with its own start sequence (`EB90`),
+deliberately not implemented here rather than half-built
+(`ccsdsUplinkFraming.m`). Every ACM feedback report or ARQ retransmit
+request — both exactly 5 bytes, 40 bits — fits in one LDPC(128,64)
+codeword's 64 information bits.
+
+**Randomizing.** CCSDS mandates a specific scrambling sequence under LDPC
+coding — `h(x) = x⁸+x⁶+x⁴+x³+x²+x+1`, all-ones initial state
+(`ccsdsUplinkRandomizer.m`) — applied *after* LDPC encoding, to the whole
+codeblock. Its job is guaranteeing bit transitions on the air regardless of
+payload, so the receiver's timing and carrier recovery keep working even
+during a run of identical bytes. The consequence for the receiver: it must
+**derandomize before decoding**, not after — a sign flip on every LLR whose
+randomizer bit is 1 (`ccsdsUplinkDecodeCodeblock.m`).
+
+**Modulation — the one deliberate deviation from the "textbook" scheme.**
+Classic CCSDS Telecommand uses PCM/PSK/PM: data modulates a subcarrier,
+which then phase-modulates the RF carrier, leaving a residual unmodulated
+carrier tone for the receiver's PLL to lock onto. This testbed uses plain
+**suppressed-carrier BPSK, no subcarrier**, because a subcarrier is
+designed for a deep-space link with a pointed dish and a phase-locked loop
+that cannot afford to lose lock — for a LEO link at 500 MHz it is pure
+overhead: it spends roughly half the transmitted power on an unmodulated
+tone and triples the occupied bandwidth for no coding gain. Dropping it
+moves two problems onto the receiver instead: there is no residual carrier
+to FFT-peak-detect any more (a suppressed-carrier BPSK signal has to be
+squared first, putting a tone at *twice* the true offset —
+`ccsdsUplinkCoarseCFO.m`), and LO leakage now lands inside the signal band
+instead of safely off to the side, so DC removal is mandatory
+(`ccsdsUplinkDCSuppress.m`).
+
+**Link budget, as actually configured:** 8 ksym/s symbol rate (chosen
+freely, since nothing constrains it once there's no subcarrier — halving
+the rate is worth 3 dB of noise performance), 200 ksym/s sample rate, 0.35
+root-raised-cosine roll-off. At 8 ksym/s an LDPC(128,64) CLTU takes 40 ms
+to transmit, over which even the fastest Doppler this link ever sees
+(≈190 Hz/s at 500 MHz) rotates the carrier phase by under 8 Hz — negligible
+within one codeblock.
+
+**Where each part of the standard is implemented** — numbered to match the
+receive chain's actual stage order, same as [§6](#6--uplink-functions--functionsuplinkm):
+
+| Standard concept | Implemented by |
+|---|---|
+| Waveform/config shared by TX and RX so they can't drift apart | `ccsdsUplinkTCConfig.m` (TX side), `ccsdsUplinkFraming.m` (RX side) |
+| Building / parsing the 5-byte command payload | `ccsdsUplinkCommand.m`, `ccsdsUplinkParseCommand.m` |
+| Randomizing sequence | `ccsdsUplinkRandomizer.m` |
+| LDPC(128,64) parity-check matrix | `ccsdsUplinkLDPCMatrix.m` |
+| PLOP-2 element generation (BPSK symbols) | `ccsdsUplinkSymbols.m` |
+| Pulse shaping (root-raised-cosine) | `ccsdsUplinkPulseShape.m` |
+| PLOP-2 transmit state machine (idle / acquisition / CLTU) | `ccsdsUplinkTxStream.m` |
+| **Stage 1** — DC/LO-leakage removal | `ccsdsUplinkDCSuppress.m` |
+| **Stage 2a** — coarse CFO by squaring | `ccsdsUplinkCoarseCFO.m` |
+| **Stage 3** — matched filtering | `ccsdsUplinkMatchedFilter.m` |
+| Optional symbol-timing recovery | `ccsdsUplinkGardner.m` |
+| **Stage 4** — CLTU start-sequence detection | `ccsdsUplinkASMDetect.m` |
+| **Stage 5** — residual carrier phase tracking | `ccsdsUplinkCostas.m` |
+| **Stages 6–7** — derandomize, then LDPC decode | `ccsdsUplinkDecodeCodeblock.m` |
+| End-to-end orchestration | `ccsdsUplinkReceive.m` |
+
+---
+
+## 5 · Downlink functions — `Functions/*.m`
+
+The forward-link DSP chain, called mainly from `S2b_Reciever.m`: everything
 between a raw 2 GHz sample stream and a corrected, measured PLFRAME ready
-for bit recovery.
+for bit recovery. This is the same chain walked stage-by-stage in
+[§3](#3--the-dvb-s2-standard-and-where-its-implemented) — this table is the
+reference version, one row per function.
 
 | Function | Role |
 |---|---|
-| `dvbs2FrameSync.m` | Locates the PLHEADER start via differential correlation against the reference SOF. |
-| `dvbs2SOFReference.m` | Reference SOF (Start Of Frame) symbols used by frame sync. |
-| `dvbs2MatchedFilterTimingSync.m` | Matched filtering plus Gardner symbol-timing recovery. |
 | `dvbs2DCBlock.m` | Removes LO-leakage / DC offset from raw receive samples. |
-| `dvbs2RawCFOCompensate.m` | Raw-sample-domain coarse CFO estimate/correction. Disabled in the current configuration. |
+| `dvbs2RawCFOCompensate.m` | Raw-sample-domain coarse CFO estimate/correction, applied before the matched filter to protect Gardner timing recovery. Disabled in the current configuration. |
+| `dvbs2MatchedFilterTimingSync.m` | Matched filtering plus Gardner symbol-timing recovery -- runs on the whole incoming chunk, BEFORE frame sync: correlation against the SOF reference below only works reliably once the stream is at one sample/symbol with matched-filter SNR. |
+| `dvbs2FrameSync.m` | Locates the PLHEADER start via differential correlation against the reference SOF, searching the matched-filtered/timing-recovered buffer. |
+| `dvbs2SOFReference.m` | Reference SOF (Start Of Frame) symbols used by frame sync. |
 | `dvbs2CoarseFreqEst.m` | Two-stage coarse carrier-frequency-offset estimate. |
 | `lrEstimate.m` | Multi-lag Luise & Reggiannini normalized frequency estimator, used by the coarse/fine CFO stages. |
 | `dvbs2FineFreqEst.m` | Pilot-aided fine carrier-frequency-offset estimate. |
@@ -136,12 +316,14 @@ for bit recovery.
 
 ---
 
-## 4 · Uplink functions — `Functions/Uplink/*.m`
+## 6 · Uplink functions — `Functions/Uplink/*.m`
 
-The return link is CCSDS Telecommand over PLOP-2 at 500 MHz: a continuous
-BPSK/NRZ-L carrier with a 16 kHz subcarrier, 4000 sym/s, carrying
+The return link is CCSDS Telecommand over PLOP-2 at 500 MHz: a continuous,
+suppressed-carrier BPSK signal — no subcarrier — at 8 ksym/s, carrying
 LDPC(128,64)-coded CLTUs. Stages are numbered to match their position in the
-receive chain.
+receive chain; see [§4](#4--the-ccsds-telecommand-standard-and-where-its-implemented)
+for why BPSK-without-subcarrier was chosen over the classical PCM/PSK/PM
+scheme.
 
 | Function | Role |
 |---|---|
@@ -165,7 +347,7 @@ receive chain.
 
 ---
 
-## 5 · TCP transport — `Functions/TCP/*.m`
+## 7 · TCP transport — `Functions/TCP/*.m`
 
 A small framing layer shared by every inter-process link. Each message is a
 4-byte little-endian length prefix followed by that many payload bytes, so a
@@ -182,7 +364,7 @@ message of any size can be told apart from the next one on the same stream.
 
 ---
 
-## 6 · Message serialization — `Functions/Serialization/*.m`
+## 8 · Message serialization — `Functions/Serialization/*.m`
 
 One pack/unpack pair per message type that crosses a process boundary, so
 every script reads and writes the same on-wire layout without duplicating
@@ -190,8 +372,8 @@ the bit-packing logic.
 
 | Function | Role |
 |---|---|
-| `dvbs2SerializePLFrame.m` / `dvbs2DeserializePLFrame.m` | Corrected PLFRAME + PLHEADER metadata, for the S2 → S3 hand-off. |
-| `dvbs2SerializeAcqChunk.m` / `dvbs2DeserializeAcqChunk.m` | One acquisition chunk (samples + scalars), for the S2a → S2 link. |
+| `dvbs2SerializePLFrame.m` / `dvbs2DeserializePLFrame.m` | Corrected PLFRAME + PLHEADER metadata, for the S2b → S3 hand-off. |
+| `dvbs2SerializeAcqChunk.m` / `dvbs2DeserializeAcqChunk.m` | One acquisition chunk (samples + scalars), for the S2a → S2b link. |
 | `dvbs2SerializeFeedback.m` / `dvbs2DeserializeFeedback.m` | ACM feedback report (mean/sigma SNR, RSSI). |
 | `dvbs2SerializeRetransmitRequest.m` / `dvbs2DeserializeRetransmitRequest.m` | Selective-repeat ARQ request, packed compactly. |
 | `dvbs2SendRetransmitRequest.m` | Serializes and writes one ARQ request, reporting whether the write actually succeeded. |
@@ -202,7 +384,7 @@ the bit-packing logic.
 
 ---
 
-## 7 · Testbed & ACM control — `Functions/Testbed/*.m`
+## 9 · Testbed & ACM control — `Functions/Testbed/*.m`
 
 Everything specific to running this testbed rather than to the
 DVB-S2/CCSDS standards themselves: shared configuration, the
@@ -211,7 +393,7 @@ carries so BER/PER can be measured at all.
 
 | Function | Role |
 |---|---|
-| `dvbs2TestbedConfig.m` | Single shared configuration — hosts/ports, hardware settings, MODCOD set, run duration — read by all four (five) scripts. |
+| `dvbs2TestbedConfig.m` | Single shared configuration — hosts/ports, hardware settings, MODCOD set, run duration — read by all five scripts. |
 | `dvbs2ACMPolicy.m` | Recommends a MODCOD from batched SNR statistics, with hysteresis and a minimum dwell time. |
 | `dvbs2SelectMODCOD.m` | Picks the highest MODCOD supportable under a variability-aware SNR bound (mean minus a margin for sigma). |
 | `dvbs2ReferencePacketPayload.m` | Deterministic, self-synchronizing test-packet payload — what lets S3 measure BER without replaying a shared RNG. |
@@ -220,11 +402,12 @@ carries so BER/PER can be measured at all.
 ### How ACM works
 
 Adaptive coding and modulation is one pipeline split across three places:
-S2 measures and reports, `dvbs2ACMPolicy.m` / `dvbs2SelectMODCOD.m` decide,
-and S1 carries out the switch. Each stage exists to solve a specific
-failure the simpler version of it produced on real hardware.
+S2b measures and reports, `dvbs2ACMPolicy.m` / `dvbs2SelectMODCOD.m` decide,
+and S1b carries out the switch and generates at the new MODCOD. Each stage
+exists to solve a specific failure the simpler version of it produced on
+real hardware.
 
-**1 · Measuring and batching SNR — S2.**
+**1 · Measuring and batching SNR — S2b.**
 Every decoded frame yields one SNR estimate from `dvbs2SNREstimate.m`,
 which accumulates into a batch. Before anything is sent, `localBatchStats`
 reduces that batch to a mean and a standard deviation — and does so
@@ -238,7 +421,7 @@ to **population** variance (divide by N, not N&minus;1), because the
 recombination formula used downstream is only exact for the population
 form.
 
-**2 · When a report is actually sent — S2.**
+**2 · When a report is actually sent — S2b.**
 Reporting is event-driven, not periodic, because a periodic trigger tied to
 frame count is wrong twice over: it isn't tied to anything physical, and it
 *speeds up* exactly when the channel is best and least worth reporting on,
@@ -260,7 +443,7 @@ would otherwise trip "the mean moved," get reported as fact, and reach the
 policy as a genuine sample. The heartbeat is deliberately exempt from that
 minimum: it has a different job, proving the receiver is alive at all —
 including when it has decoded nothing. That is what makes **silence itself
-informative**: if S1 hears nothing within `linkLossSec` (5 s), the only
+informative**: if S1b hears nothing within `linkLossSec` (5 s), the only
 possible reading is that the channel is still within 0.5 dB of the last
 report, not that anything has failed.
 
@@ -340,16 +523,19 @@ had been building toward mature at exactly the moment the receiver proved
 it could decode nothing at the current rung.
 
 **5 · Link establishment — the cold start.**
-The very first feedback message S1 ever receives is treated differently:
-with no current MODCOD and no history to protect, S1 calls
+The very first feedback message S1b ever receives is treated differently:
+with no current MODCOD and no history to protect, S1b calls
 `dvbs2SelectMODCOD` directly on that first batch's own mean and sigma
 (trend term forced to zero) to pick a starting rung, then hands control to
 the steady-state policy from the next report onward. Routing the bootstrap
 through the same function the steady-state policy uses is deliberate —
 there is exactly one place that reads the MODCOD ladder, so the two paths
-cannot drift into disagreeing about what a given SNR supports.
+cannot drift into disagreeing about what a given SNR supports. Until that
+first report arrives, S1b transmits calibration bursts at MODCOD 1 instead
+of real data, so the link has something robust to lock onto before ACM has
+any statistics to act on.
 
-**6 · What a switch actually costs — S1.**
+**6 · What a switch actually costs — S1b.**
 At the switch itself, only the waveform-generator object is released and
 reconfigured:
 
@@ -359,13 +545,13 @@ cfgDVBS2.MODCOD = recommendedMODCOD;
 cfgDVBS2.DFL    = getDFL(recommendedMODCOD, cfgDVBS2.FECFrame);
 ```
 
-The radio transmitter object itself is never released mid-run — its only
-`release` call is the `onCleanup` that fires at script end. That matters
-because of the transmit FIFO: the radio always consumes fixed-size blocks
-regardless of which MODCOD produced the samples currently sitting in the
-FIFO, so reconfiguring the waveform generator costs some CPU time but
-produces no gap in the transmitted carrier — the FIFO's existing backlog
-covers it.
+The radio transmitter object itself (in S1a, a separate process now) is
+never released mid-run — its only `release` call is the `onCleanup` that
+fires at script end. That matters because of the transmit FIFO: the radio
+always consumes fixed-size blocks regardless of which MODCOD produced the
+samples currently sitting in the FIFO, so reconfiguring the waveform
+generator costs some CPU time but produces no gap in the transmitted
+carrier — the FIFO's existing backlog covers it.
 
 > **Open item.** `dvbs2SelectMODCOD.m`'s own comment justifying the jump
 > cap still says "every MODCOD change costs S1 a radio release and
@@ -373,9 +559,71 @@ covers it.
 > longer true of what the code does today. Not a functional bug, just a
 > comment that wants updating to match the current mechanism.
 
+**7 · Generation moved to its own process, and the pacing/pipelining that
+required — S1a/S1b.**
+Generation, the transmit FIFO, and ACM policy all used to live in the same
+process as the radios, where `radioTx()`'s own blocking call implicitly
+paced the whole loop to real time. Splitting the radios out into
+`S1a_Transmitter.m` removed that implicit clock; `S1b_ACMControl.m` paces
+itself explicitly instead, waiting out whatever remains of one block's
+airtime after each send, so ACM feedback keeps arriving at the same
+debounced ~400 ms cadence it always did rather than being evaluated on
+every individual report the moment the two concerns were split apart (the
+first attempt at this split did exactly that, and MODCOD started
+oscillating as a result — a single bad SNR estimate reaching an
+unprotected `agreeCountDown=1, minDwellSecDown=0` policy was enough to
+trigger a spurious multi-rung drop).
+
+That still leaves a synchronous, single-buffered link between the two
+processes exposed to one thing the old single-process design never had to
+worry about: a generation tick that runs long has nothing to fall back on
+but S1a stalling with nothing to send. Measured on hardware, raising
+`config.tx.genBudgetFraction` to buy back idle time this way made loss
+*worse*, not better (16.1% dummy filler / 7.2% generation-deadline misses /
+2.5% TX underruns / 11.8% frame loss at 0.35, versus 5.4% / 24.8% / 11.0% /
+25.9% at 0.55) — the idle time it was spending was the margin keeping ticks
+close to their deadline, not waste.
+
+The fix is a one-block lookahead pipeline in S1b's main loop
+(`pendingBlock`/`pendingMeta`), plus a local fallback in S1a for whenever
+that pipeline still comes up empty:
+
+- **Prefetch.** S1b generates one block *ahead* of the one it is currently
+  sending, so an occasional slow tick is absorbed by the already-ready
+  queued block instead of stalling S1a directly.
+- **Stale-drop.** A pending block was built for whatever MODCOD/link-state
+  was current when it was generated. If ACM has since moved on before it
+  ships, sending it anyway would push one more block at a MODCOD the
+  policy has already abandoned — exactly what the deliberately
+  zero-dwell, one-report downward switch (point 4 above) exists to
+  prevent. S1b drops it instead (`blocksDropped` in its profile) and
+  regenerates fresh.
+- **Local dummy fallback.** If S1a's wait for the next TX block runs past
+  a bounded threshold — comfortably under one full block period — it stops
+  waiting and synthesizes its own dummy PLFRAME via `dvbs2DummyFiller.m`
+  rather than let the carrier drop (`localDummyBlocksSent` in its own
+  profile). This is expected, not an error condition: it is what a tick
+  where S1b's new-data budget is exhausted, or where a stale block just
+  got dropped, looks like from S1a's side.
+
+Measured back to back on the same hardware, all four configurations
+climbing to 32APSK under comparably heavy load: 0.35 without the pipeline
+(11.8% frame loss, the pre-existing baseline above), 0.55 without it
+(25.9%, the collapse this was built to fix), 0.35 with the pipeline
+(11.1%), and 0.45 with the pipeline (13.2% filler / 25.8% misses / 14.0%
+underruns / **8.0% loss** — the best frame-loss figure of the four, despite
+the worst internal misses/underruns numbers of the four). The pattern
+holds: once a slow tick has somewhere to land other than S1a's radio,
+internal timing pressure stops translating into frame loss the way it used
+to — the two mechanisms above absorb it instead, at the cost of somewhat
+more filler and more TX underruns than the single-buffered design paid
+when it wasn't under enough load to expose the problem at all. See the
+measurement history in `config.tx.genBudgetFraction`'s own comment in
+`dvbs2TestbedConfig.m` for the full numbers.
+
 ---
 
-## 8 · Hardware bring-up scripts — `sdr_test/`
+## 10 · Hardware bring-up scripts — `sdr_test/`
 
 Standalone commissioning tools, not part of the live flowgraph:
 `CheckRadios.m` (confirms both USRPs answer at their configured IPs),
@@ -385,15 +633,16 @@ one radio can transmit and receive together), `IsolationTest_Near.m` /
 `IsolationTest_Far.m` (leakage between the two radios), and the standalone
 `UplinkTx.m` / `UplinkRx.m` pair with their no-radio `*Test.m` variants,
 which let the CCSDS uplink chain be verified before it was folded into
-S1/S2a. `sdrTestConfig.m` holds the shared settings for this group.
+S1a/S1b. `sdrTestConfig.m` holds the shared settings for this group.
 
-> These predate the operational split into S1/S2a/S2/S3 and are kept as a
-> reference for re-verifying one radio or one chain in isolation, not as
-> something the live system calls.
+> These predate the operational split into S1a/S1b/S2a/S2b/S3 and are kept
+> as a reference for re-verifying one radio or one chain in isolation, not
+> as something the live system calls.
 
 ---
 
 *DVB-S2 satellite ground-segment testbed — Erasmus project, Aarhus
-University. Architecture chapter, first draft: process and function
-inventory only. Per-function theory and the reasoning behind each design
-decision are covered separately, block by block, as later sections.*
+University. Covers the two standards implemented, the process/function
+inventory, and the ACM control loop in detail. Deeper theory for individual
+functions not covered above, and the reasoning behind specific design
+decisions, are covered separately, block by block, as follow-up sections.*

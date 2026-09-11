@@ -1214,12 +1214,24 @@ config.maxFrames = Inf;
 % the ladder before it ends. Two minutes gives the ACM loop room to walk up
 % through 8PSK and into the APSK rungs and settle there.
 %
-% NOTE ON READING THE PROFILES: S1a should be started first (it has the most
-% to bring up: two UHD sessions before a single sample leaves), so it also
-% FINISHES first. Once it stops, S2a's RSSI drops to about -52 dB -- that is
-% the USRP's LO leakage with nothing being fed to it, not a fault. Expect a
-% tail of "DECODED NOTHING" heartbeats at the end of S2b's log equal to
-% however long S1a was started ahead of the receivers.
+% NOTE ON READING THE PROFILES -- AND A CORRECTION TO WHAT THIS USED TO SAY.
+% This comment previously claimed S1a should launch first, and that S2a's
+% RSSI dropping to about -52 dB near the end of a run was simply "S1a
+% stopped, so the USRP has nothing fed to it -- LO leakage, not a fault."
+% That explanation is INCOMPLETE: measured directly on hardware, across
+% multiple runs, the RSSI collapse consistently starts 45-140+ seconds
+% BEFORE S1a actually stops transmitting, not after. Something else is
+% happening first; S1a finishing is not the trigger, even though the two
+% events can look adjacent in a short run. Root cause still open.
+%
+% Launch-DVBS2Testbed.ps1's launch order is now S2a/S2b, then S1a/S1b,
+% then S3 -- S2a and S2b have the most expensive cold start (radio
+% construction, USRP driver init) and get first claim on the stagger's
+% headroom; S3 initializes fastest and goes last. Every process blocks on
+% its own downstream connections before doing real work regardless of
+% launch order (S1a/S1b/S2a all wait on a server before proceeding; see
+% each script's own comments), so this ordering is about giving the
+% stagger's time budget to whoever needs it most, not about correctness.
 config.runDurationSec = 120;
 
 end

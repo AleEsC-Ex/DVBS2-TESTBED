@@ -17,7 +17,15 @@
       1. build the command line MATLAB needs ( -r "run('...')" )
       2. hand it to Start-Process, which opens a new window and returns
          immediately (it does NOT wait for that window to finish)
-      3. remember the new window's process ID, so it can be closed later
+
+    Stopping a window later (Stop-DVBS2Testbed.ps1) does NOT use the PID
+    Start-Process returns here -- that PID belongs to a short-lived
+    bootstrap process which hands off to the real, long-running MATLAB
+    engine as a CHILD process and then exits within a second or two, so by
+    the time anything tries to stop it, it is already gone. Stop-
+    DVBS2Testbed.ps1 finds the real engine by matching its command line
+    against each script's name instead; see that file's own header for the
+    full story.
 
 .USAGE
     Just run this file from PowerShell:  .\Launch-DVBS2Testbed.ps1
@@ -79,7 +87,6 @@ if (-not (Test-Path $logDir)) {
 }
 
 $timestamp = Get-Date -Format 'yyyy-MM-dd_HHmmss'
-$startedProcesses = @()
 
 Write-Host "=== DVB-S2 testbed launcher ===" -ForegroundColor Cyan
 Write-Host "MATLAB:  $matlabExe"
@@ -130,16 +137,14 @@ foreach ($s in $scripts) {
         -ArgumentList @('-nodesktop', '-nosplash', '-logfile', "`"$logPath`"", '-r', "`"$runCmd`"") `
         -PassThru
 
-    $startedProcesses += [PSCustomObject]@{ Name = $s.Name; PID = $proc.Id; Log = $logPath }
-    Write-Host ("  started {0,-4} (PID {1,-6}) -- log: {2}" -f $s.Name, $proc.Id, $logPath) -ForegroundColor Green
+    # This PID is the short-lived bootstrap process, not the real MATLAB
+    # engine that ends up running the script (see the docstring above) --
+    # printed only as a bring-up sanity check, not something anything else
+    # in this testbed relies on to identify the process later.
+    Write-Host ("  started {0,-4} (bootstrap PID {1,-6}) -- log: {2}" -f $s.Name, $proc.Id, $logPath) -ForegroundColor Green
 
     Start-Sleep -Seconds $staggerSeconds
 }
-
-# Save the PIDs so Stop-DVBS2Testbed.ps1 can find them even from a
-# different PowerShell session (e.g. if this window gets closed).
-$pidFile = Join-Path $logDir 'last-run-pids.txt'
-$startedProcesses | ForEach-Object { "$($_.Name)=$($_.PID)" } | Set-Content -Path $pidFile -Encoding utf8
 
 Write-Host ""
 Write-Host "All windows started. Each stops on its own after its configured run duration." -ForegroundColor Cyan

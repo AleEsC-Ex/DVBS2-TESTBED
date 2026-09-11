@@ -36,25 +36,16 @@
 $ErrorActionPreference = 'Stop'
 
 # ---------------------------------------------------------------------
-# WHAT TO LAUNCH, AND IN WHAT ORDER. Name is only used for window/log
-# labelling; File is the script's path relative to the Testbed/ folder
-# (see $codeDir below) -- all the MATLAB source lives there, separate from
-# this launcher and the repo's docs/README at the root.
-#
-# Startup order does not affect CORRECTNESS -- every process retries its
-# own connections regardless of who else is up yet -- but it does affect
-# how much of the stagger's headroom each one actually gets, since it's
-# spent between launches, not evenly. S2a and S2b are ordered first
-# because they have the most expensive cold start (radio construction,
-# USRP driver init) and benefit most from a head start; S1a/S1b follow;
-# S3 -- the cheapest, fastest process to initialize -- goes last, since it
-# needs the least of the stagger's headroom to be ready in time.
+# WHAT TO LAUNCH. Name is only used for window/log labelling; File is the
+# script's path relative to the Testbed/ folder (see $codeDir below) --
+# all the MATLAB source lives there, separate from this launcher and the
+# repo's docs/README at the root.
 # ---------------------------------------------------------------------
 $scripts = @(
-    @{ Name = 'S2a'; File = 'S2a_RFAcquisition.m' }
-    @{ Name = 'S2b'; File = 'S2b_Reciever.m' }
     @{ Name = 'S1a'; File = 'S1a_Transmitter.m' }
     @{ Name = 'S1b'; File = 'S1b_ACMControl.m' }
+    @{ Name = 'S2a'; File = 'S2a_RFAcquisition.m' }
+    @{ Name = 'S2b'; File = 'S2b_Reciever.m' }
     @{ Name = 'S3';  File = 'S3_ProcessingUnit.m' }
 )
 
@@ -64,15 +55,15 @@ $scripts = @(
 # processes cold-starting within ~4.5 s of each other produced 214 RX
 # overruns, 25 TX underruns and 10.8% frame loss, none of it from a code bug
 # -- purely from four license checks / JIT compiles / USRP driver inits
-# competing for the same CPU cores at once. 15 s spaces that out so each
-# process's expensive one-time startup cost has mostly settled before the
-# next one begins competing for it. (Briefly lowered to 5 s on 2026-09-11
-# on the reasoning that every process now blocks on its own downstream
-# connections before doing real work, so a shorter stagger couldn't cause
-# a correctness problem -- restored to 15 s per instruction, combined with
-# reordering $scripts above so the slowest-starting processes get launched
-# first and get the most benefit from whatever stagger there is.)
-$staggerSeconds = 15
+# competing for the same CPU cores at once. Originally set to 15 s;
+# lowered to 5 s on 2026-09-11 now that every process blocks on its own
+# downstream connections before doing real work (S1a/S1b already did;
+# S2a now also waits for S3 -- see its own comment), which bounds how much
+# a fast-starting process can race ahead of a slow one regardless of the
+# stagger value. Revisit this number (back up towards 15s) if RX/TX
+# over/underruns climb again on a cold start -- that would mean 5 s isn't
+# enough headroom for the license-check/JIT contention this was for.
+$staggerSeconds = 5
 
 # ---------------------------------------------------------------------
 # Locate matlab.exe. Prefers whatever is already on PATH; falls back to

@@ -1,12 +1,34 @@
-%S1a_TRANSMITTER Radio I/O only -- both the downlink TX and uplink RX radios.
+%S1a_TRANSMITTER Both radios, plus CCSDS uplink acquisition (stages 1-5).
 %
 %   Owns both radios (same shared IP, which is why they cannot be split
-%   across two processes) and generates nothing of its own. Every
-%   transmitted sample comes from S1b_ACMControl.m over
-%   config.txBlockPort; every received uplink sample is forwarded there
-%   over config.uplinkAcqPort, unprocessed. This script makes no MODCOD
-%   decisions, runs no ACM policy, and validates no retransmit requests
-%   -- it moves bytes between two TCP links and two radios, nothing else.
+%   across two processes) and generates nothing of the downlink waveform
+%   itself -- every transmitted sample comes from S1b_ACMControl.m over
+%   config.txBlockPort. This script makes no MODCOD decisions, runs no ACM
+%   policy, and validates no retransmit requests.
+%
+%   IT DOES, HOWEVER, RUN THE FRONT HALF OF THE UPLINK RECEIVER. Raw
+%   samples off the uplink radio go straight into ccsdsUplinkAcquire.m
+%   (Functions/Uplink/ccsdsUplinkAcquire.m) -- stages 1-5: DC suppression,
+%   coarse carrier acquisition, matched filtering, optional Gardner timing,
+%   ASM/CLTU start-sequence detection, and Costas-loop phase tracking. Only
+%   CLTUs that actually clear the ASM correlation get forwarded to
+%   S1b_ACMControl.m over config.uplinkAcqPort, as their Costas-tracked
+%   codeword symbols plus the two scalars (amplitude, noise variance)
+%   ccsdsUplinkDecodeCodeblock.m needs to finish the job -- not the
+%   continuous, mostly-idle raw sample stream PLOP-2's own continuous
+%   carrier produces. S1b is left with stages 6-8 only: derandomize, LDPC
+%   decode, command recovery.
+%
+%   WHY THIS BOUNDARY, AND NOT ANOTHER ONE. Stages 1-5 are what actually
+%   pace with the CONTINUOUS uplink carrier -- CCSDS PLOP-2 is deliberately
+%   never keyed off, specifically so a receiver's carrier/timing loops never
+%   lose lock waiting for a message, which means something has to keep
+%   processing that stream end to end regardless of whether it currently
+%   carries a real command or idle sequence. Stages 6-8 are the opposite:
+%   they only ever run once per DETECTED burst, a discrete, occasional
+%   event, with no continuity requirement of their own. Splitting exactly
+%   here turns a continuous-DSP problem plus an occasional-decode problem
+%   into two processes that each only have to solve one of them.
 %
 %   Run this alongside the other four scripts, each as its own MATLAB
 %   instance, IN ANY ORDER -- every TCP client connection in this testbed
@@ -85,10 +107,10 @@ else
     % just double the delay for no benefit.
 end
 
-%% Uplink radio (RF mode only) -- forwards raw samples to S1b, decodes nothing
+%% Uplink radio (RF mode only) -- acquires CLTUs, forwards only what it finds
 uplinkRF = config.useSDR && config.uplink.useRF;
 uplinkOverruns = 0;
-uplinkChunksForwarded = 0;
+uplinkChunksRead = 0;
 % Samples the uplink radio has produced but this process has not collected
 % yet, carried between iterations so the drain below never over- or
 % under-reads. See the drain in the main loop for why this exists.
@@ -113,6 +135,9 @@ if uplinkRF
     cleanupUplinkRx = onCleanup(@() release(radioUplinkRx));
     fprintf('S1a: return link over RF -- receiving on %s at %.3f MHz, gain %g dB\n', ...
         u.rxIPAddress, u.centerFrequency/1e6, u.rxGain);
+
+    % ccsdsUplinkAcquire and its DC blocker both hold state across calls.
+    clear ccsdsUplinkAcquire ccsdsUplinkDCSuppress;
 end
 
 %% TX block input FROM S1b
@@ -142,9 +167,19 @@ end
 
 runTic = tic;
 airtimeSec = 0;
-prof = struct('uplinkRadio', 0, 'uplinkForward', 0, 'blockWait', 0, 'radioTxTime', 0, ...
+prof = struct('uplinkRadio', 0, 'uplinkDSP', 0, 'uplinkForward', 0, 'blockWait', 0, 'radioTxTime', 0, ...
     'reads', 0, 'emptyReads', 0, 'iters', 0, 'underruns', 0, 'blocksReceived', 0, ...
     'localDummyBlocksSent', 0);
+% Uplink acquisition diagnostics (stages 1-5, see ccsdsUplinkAcquire.m) --
+% aggregated across the whole run, the same figures S1b's profile used to
+% report before acquisition moved here.
+uplinkWindows = 0;
+uplinkDetections = 0;
+uplinkAsmLocks = 0;
+uplinkDuplicates = 0;
+uplinkBestCarrierDB = -Inf;
+uplinkBestASMMetric = 0;
+uplinkCLTUsForwarded = 0;
 
 fprintf('\nS1a: starting radio I/O loop (%d-sample blocks) ...\n', txBlockSamples);
 
@@ -155,12 +190,14 @@ while true
         wall = toc(runTic);
         fprintf('\n=== S1a PROFILE === %.1f s wall | %.1f s airtime | RT factor %.3f | %d iterations\n', ...
             wall, airtimeSec, wall/max(airtimeSec,eps), prof.iters);
-        accounted = prof.uplinkRadio + prof.uplinkForward + prof.blockWait + prof.radioTxTime;
+        accounted = prof.uplinkRadio + prof.uplinkDSP + prof.uplinkForward + prof.blockWait + prof.radioTxTime;
         fprintf('  uplink radio reads   %7.2f s  %5.1f%%   %d reads (%d empty), %.1f ms each\n', ...
             prof.uplinkRadio, 100*prof.uplinkRadio/wall, prof.reads, prof.emptyReads, ...
             1e3*prof.uplinkRadio/max(prof.reads,1));
-        fprintf('  uplink forward to S1b %6.2f s  %5.1f%%   %d chunks\n', ...
-            prof.uplinkForward, 100*prof.uplinkForward/wall, uplinkChunksForwarded);
+        fprintf('  uplink acquisition   %7.2f s  %5.1f%%   %d windows, %d detections, %d ASM locks, %d duplicates\n', ...
+            prof.uplinkDSP, 100*prof.uplinkDSP/wall, uplinkWindows, uplinkDetections, uplinkAsmLocks, uplinkDuplicates);
+        fprintf('  uplink forward to S1b %6.2f s  %5.1f%%   %d CLTUs forwarded\n', ...
+            prof.uplinkForward, 100*prof.uplinkForward/wall, uplinkCLTUsForwarded);
         fprintf('  waiting for TX block %7.2f s  %5.1f%%   %d blocks received\n', ...
             prof.blockWait, 100*prof.blockWait/wall, prof.blocksReceived);
         fprintf('  radioTx              %7.2f s  %5.1f%%\n', ...
@@ -171,6 +208,8 @@ while true
         fprintf('  TX underruns %d of %d blocks | uplink RX overruns %d | local dummy fallback %d blocks (%.1f%%)\n', ...
             prof.underruns, prof.blocksReceived, uplinkOverruns, ...
             prof.localDummyBlocksSent, 100*prof.localDummyBlocksSent/max(prof.blocksReceived,1));
+        fprintf('  uplink acquisition quality: best carrier %.1f dB, best ASM metric %.3f\n', ...
+            uplinkBestCarrierDB, uplinkBestASMMetric);
         fprintf('  per iteration: %.1f ms wall, %.1f ms of airtime produced\n\n', ...
             1e3*wall/max(prof.iters,1), 1e3*airtimeSec/max(prof.iters,1));
         break;
@@ -189,13 +228,13 @@ while true
     % cost to the transmit path.
     drawnow limitrate;
 
-    %% Drain the uplink radio and forward it to S1b, RF mode only
+    %% Drain the uplink radio, acquire CLTUs, forward only what's found
     % Unchanged pacing logic from before the split -- only what happens to
-    % each read changed (forward, not decode). See the long comment this
-    % used to carry (still in S1b_ACMControl.m's docstring) for why the
-    % credit is taken from lastBurstSec (downlink airtime just produced)
-    % rather than from wall-clock time: it is what keeps two radios
-    % sharing one loop from starving each other.
+    % each read changed (acquire, not just relay). See the long comment
+    % this used to carry (still in S1b_ACMControl.m's docstring) for why
+    % the credit is taken from lastBurstSec (downlink airtime just
+    % produced) rather than from wall-clock time: it is what keeps two
+    % radios sharing one loop from starving each other.
     if uplinkRF
         uplinkDebtSamples = min( ...
             uplinkDebtSamples + lastBurstSec * config.uplink.sampleRate, ...
@@ -218,10 +257,29 @@ while true
                 prof.emptyReads = prof.emptyReads + 1;
                 break;
             end
+            uplinkChunksRead = uplinkChunksRead + 1;
+
+            % Stages 1-5: DC suppress, coarse CFO, matched filter, optional
+            % Gardner, ASM detect, Costas -- see ccsdsUplinkAcquire.m. Runs
+            % on every read, continuously, because PLOP-2's carrier never
+            % keys off; only what comes OUT of this (a detected CLTU, most
+            % reads produce none at all) is worth sending anywhere.
+            tDSP = tic;
+            [cltus, aInfo] = ccsdsUplinkAcquire(uRx(1:uLen), config);
+            prof.uplinkDSP = prof.uplinkDSP + toc(tDSP);
+            uplinkWindows = uplinkWindows + aInfo.windows;
+            uplinkDetections = uplinkDetections + aInfo.detections;
+            uplinkAsmLocks = uplinkAsmLocks + aInfo.asmLocks;
+            uplinkDuplicates = uplinkDuplicates + aInfo.duplicates;
+            uplinkBestCarrierDB = max(uplinkBestCarrierDB, aInfo.bestCarrierDB);
+            uplinkBestASMMetric = max(uplinkBestASMMetric, aInfo.bestASMMetric);
+
             tFwd = tic;
-            dvbs2TCPFrameWrite(uplinkAcqClient, dvbs2ComplexToBytes(uRx(1:uLen)));
+            for c = 1:numel(cltus)
+                dvbs2TCPFrameWrite(uplinkAcqClient, dvbs2SerializeCLTU(cltus{c}));
+                uplinkCLTUsForwarded = uplinkCLTUsForwarded + 1;
+            end
             prof.uplinkForward = prof.uplinkForward + toc(tFwd);
-            uplinkChunksForwarded = uplinkChunksForwarded + 1;
         end
     end
 
@@ -301,9 +359,9 @@ while true
     if mod(prof.blocksReceived, 10) == 0
         if uplinkRF
             fprintf(['S1a: block %d transmitted | RT factor %.3f | ' ...
-                'uplink %d chunks forwarded, %d RX overruns\n'], ...
+                'uplink %d reads, %d CLTUs found, %d RX overruns\n'], ...
                 prof.blocksReceived, toc(runTic)/max(airtimeSec,eps), ...
-                uplinkChunksForwarded, uplinkOverruns);
+                uplinkChunksRead, uplinkCLTUsForwarded, uplinkOverruns);
         else
             fprintf('S1a: block %d transmitted | RT factor %.3f\n', ...
                 prof.blocksReceived, toc(runTic)/max(airtimeSec,eps));

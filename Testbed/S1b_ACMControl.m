@@ -1,12 +1,22 @@
-%S1B_ACMCONTROL Waveform generation, ACM control, and uplink recovery.
+%S1B_ACMCONTROL Waveform generation, ACM control, and uplink command decode.
 %
 %   Owns everything S1a_Transmitter.m does not: the DVB-S2 waveform
 %   generator, the transmit FIFO, the selective-repeat ARQ retransmit
-%   queue, ACM policy (Functions/dvbs2ACMPolicy.m), and -- in RF mode --
-%   the whole CCSDS Telecommand uplink receive chain
-%   (Functions/Uplink/ccsdsUplinkReceive.m). S1a is left with only what
-%   genuinely cannot move: the two radios themselves, which share one IP
-%   and so must stay in one process.
+%   queue, and ACM policy (Functions/dvbs2ACMPolicy.m). S1a is left with
+%   only what genuinely cannot move: the two radios themselves, which
+%   share one IP and so must stay in one process.
+%
+%   UPLINK: ONLY STAGES 6-8 LIVE HERE NOW. S1a runs CCSDS uplink
+%   acquisition (Functions/Uplink/ccsdsUplinkAcquire.m, stages 1-5 -- DC
+%   suppress through Costas tracking) on the continuous raw uplink stream,
+%   close to the radio, and forwards only the CLTUs that actually clear
+%   the ASM correlation. This process receives those (already
+%   Costas-tracked, already timing/phase-aligned) codeword symbols over
+%   config.uplinkAcqPort and runs just derandomize + LDPC decode
+%   (Functions/Uplink/ccsdsUplinkDecodeCodeblock.m) on each -- a discrete,
+%   occasional decode, not a continuous-stream DSP problem, which is
+%   exactly why it was worth splitting off from acquisition in the first
+%   place. See S1a_Transmitter.m's own docstring for the full reasoning.
 %
 %   WHY GENERATION MOVED HERE TOO, WHEN THE FIRST VERSION OF THIS SPLIT
 %   DELIBERATELY LEFT IT IN S1a. That first version only moved uplink
@@ -95,9 +105,6 @@ end
 % second, symmetric in both files): neither side ever came up.
 uplinkRF = config.useSDR && config.uplink.useRF;
 if uplinkRF
-    % ccsdsUplinkReceive and its DC blocker both hold state across calls.
-    clear ccsdsUplinkReceive ccsdsUplinkDCSuppress;
-
     fprintf('S1b: opening uplink acquisition server on port %d, waiting for S1a to connect ...\n', ...
         config.uplinkAcqPort);
     uplinkAcqServer = dvbs2TCPServerRetry(config.uplinkAcqHost, config.uplinkAcqPort, "S1b's uplink acquisition server");
@@ -129,17 +136,18 @@ lastReturnTic = tic;
 returnLinkLost = false;
 uplinkFbQueue = {};
 uplinkRtQueue = {};
-% Note: RX overruns are a radio-level metric, tracked in S1a's own
-% profile, not here -- this process never touches the radio.
+% Note: RX overruns and acquisition-quality figures (carrier level, ASM
+% metric) are S1a-side metrics now, tracked in its own profile -- this
+% process never touches the radio and never runs stages 1-5 any more, only
+% the decode (stages 6-7) of whatever CLTUs S1a already found.
 uplinkDecodes = 0;
 uplinkParityFails = 0;
-uplinkPeakDB = -Inf;
 uplinkEsNodB = NaN;
-% How many raw chunks were actually drained and handed to
-% ccsdsUplinkReceive -- compare against S1a's "chunks forwarded" count in
-% its own profile. The two should be close; a big gap means this loop is
-% falling behind S1a's forwarding rate again.
-chunksReceived = 0;
+% How many CLTU messages were actually drained and handed to
+% ccsdsUplinkDecodeCodeblock -- compare against S1a's "CLTUs found" count
+% in its own profile. The two should match exactly; a gap means this loop
+% is falling behind S1a's forwarding rate.
+cltusReceived = 0;
 
 %% Retransmit-request queue -- validated and applied HERE now, because
 % globalPktIdx (below) lives here too: generation and its bookkeeping
@@ -226,8 +234,8 @@ while true
         fprintf('\n=== S1b PROFILE === %.1f s wall | %.1f s airtime | RT factor %.3f | %d iterations\n', ...
             wall, airtimeSec, wall/max(airtimeSec,eps), prof.iters);
         accounted = prof.uplinkDSP + prof.waveformGen + prof.blockSend + prof.pacingWait;
-        fprintf('  uplink DSP           %7.2f s  %5.1f%%   %d chunks received, %d decodes, %d parity fails, peak %.1f dB, Es/No %.1f dB\n', ...
-            prof.uplinkDSP, 100*prof.uplinkDSP/wall, chunksReceived, uplinkDecodes, uplinkParityFails, uplinkPeakDB, uplinkEsNodB);
+        fprintf('  uplink decode        %7.2f s  %5.1f%%   %d CLTUs received, %d decodes, %d parity fails, Es/No %.1f dB\n', ...
+            prof.uplinkDSP, 100*prof.uplinkDSP/wall, cltusReceived, uplinkDecodes, uplinkParityFails, uplinkEsNodB);
         fprintf('  waveform generation  %7.2f s  %5.1f%%\n', ...
             prof.waveformGen, 100*prof.waveformGen/wall);
         fprintf('  block send to S1a    %7.2f s  %5.1f%%\n', ...
@@ -285,44 +293,46 @@ while true
 
     %% Collect fbBytes/rtBytes, whichever source is in use
     if uplinkRF
-        % DRAIN EVERY CHUNK CURRENTLY BUFFERED, not just one. S1a forwards
-        % roughly one chunk every ~43 ms; this loop's own pacing tick
-        % (bottom of the iteration) is ~400 ms, so ~10 chunks arrive per
-        % tick. Reading only one per tick here -- the first version of
-        % this loop did exactly that -- meant ~90% of them were never
-        % read at all: they sat in the OS socket buffer, S1a's own
-        % blocking writes backed up waiting for room, and
-        % ccsdsUplinkReceive never saw them. Measured on hardware: 0
-        % decodes across an entire 120 s run. Draining in a tight loop
-        % here, and pacing only the GENERATION side below, is what
-        % keeps reading fast while still debouncing ACM evaluation.
-        chunksThisTick = 0;
+        % DRAIN EVERY CLTU CURRENTLY BUFFERED, not just one. S1a forwards
+        % one message per DETECTED CLTU now (not one per radio read, the
+        % old raw-relay design) -- but a burst of commands can still queue
+        % up several in a row, and the same "read only one per tick"
+        % mistake that used to lose ~90% of raw chunks would just as
+        % easily lose queued CLTUs here. Draining in a tight loop, and
+        % pacing only the GENERATION side below, is what keeps reading
+        % fast while still debouncing ACM evaluation.
+        cltusThisTick = 0;
         while true
-            chunkBytes = dvbs2TCPFrameTryRead(uplinkAcqServer);
-            if isempty(chunkBytes)
+            cltuBytes = dvbs2TCPFrameTryRead(uplinkAcqServer);
+            if isempty(cltuBytes)
                 break;
             end
-            chunksThisTick = chunksThisTick + 1;
-            samples = dvbs2BytesToComplex(chunkBytes);
+            cltusThisTick = cltusThisTick + 1;
+            cltu = dvbs2DeserializeCLTU(cltuBytes);
+
+            % Stages 6 and 7 only -- derandomize, LDPC decode. Acquisition
+            % (stages 1-5) already happened in S1a; see its own docstring
+            % and ccsdsUplinkAcquire.m for why the split lands here.
             tDSP = tic;
-            [~, uInfo] = ccsdsUplinkReceive(samples, config);
+            [payload, ok, ~] = ccsdsUplinkDecodeCodeblock( ...
+                cltu.codeSyms, cltu.amplitude, cltu.noiseVar, config);
             prof.uplinkDSP = prof.uplinkDSP + toc(tDSP);
-            uplinkDecodes = uplinkDecodes + uInfo.decodes;
-            uplinkParityFails = uplinkParityFails + uInfo.parityFails;
-            uplinkPeakDB = max(uplinkPeakDB, uInfo.bestCarrierDB);
-            if isfinite(uInfo.esNodB), uplinkEsNodB = uInfo.esNodB; end
+            if isfinite(cltu.esNodB), uplinkEsNodB = cltu.esNodB; end
+
+            if ~ok
+                uplinkParityFails = uplinkParityFails + 1;
+                continue;
+            end
+            uplinkDecodes = uplinkDecodes + 1;
 
             % One uplink, two message types -- routed on the 3-bit type
             % field that heads every control message.
-            for p = 1:numel(uInfo.payloads)
-                payload = uInfo.payloads{p};
-                switch dvbs2MessageType(payload)
-                    case 0, uplinkFbQueue{end+1} = payload; %#ok<SAGROW>
-                    case 1, uplinkRtQueue{end+1} = payload; %#ok<SAGROW>
-                end
+            switch dvbs2MessageType(payload)
+                case 0, uplinkFbQueue{end+1} = payload; %#ok<SAGROW>
+                case 1, uplinkRtQueue{end+1} = payload; %#ok<SAGROW>
             end
         end
-        chunksReceived = chunksReceived + chunksThisTick;
+        cltusReceived = cltusReceived + cltusThisTick;
 
         % FEEDBACK: NEWEST WINS, older ones are discarded -- a report is a
         % statistical summary of the link right now, so an older one is
@@ -489,8 +499,8 @@ while true
         if sentMeta.IsCalibration
             if mod(genState.calibBurstNum, 50) == 0
                 if uplinkRF
-                    feedbackStateStr = sprintf('RF uplink peak %.1f dB, Es/No %.1f dB, %d decoded', ...
-                        uplinkPeakDB, uplinkEsNodB, uplinkDecodes);
+                    feedbackStateStr = sprintf('RF uplink Es/No %.1f dB, %d decoded (carrier level: see S1a''s log)', ...
+                        uplinkEsNodB, uplinkDecodes);
                 elseif feedbackServer.Connected
                     feedbackStateStr = 'feedback link UP';
                 else
@@ -501,10 +511,9 @@ while true
         elseif mod(genState.burstNum, 10) == 0
             if uplinkRF
                 fprintf(['S1b: burst %d sent (MODCOD %d, %d frames so far) | RT factor %.3f | ' ...
-                    'uplink %d decoded, peak %.1f dB, Es/No %.1f dB\n'], ...
+                    'uplink %d decoded, Es/No %.1f dB\n'], ...
                     genState.burstNum, currentMODCOD, genState.frameSeqNum, toc(runTic)/max(airtimeSec,eps), ...
-                    uplinkDecodes, uplinkPeakDB, uplinkEsNodB);
-                uplinkPeakDB = -Inf;   % per-interval, so a dying link shows up
+                    uplinkDecodes, uplinkEsNodB);
             else
                 fprintf('S1b: burst %d sent (MODCOD %d, %d frames so far) | RT factor %.3f\n', ...
                     genState.burstNum, currentMODCOD, genState.frameSeqNum, toc(runTic)/max(airtimeSec,eps));

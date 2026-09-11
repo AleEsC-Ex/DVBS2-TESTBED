@@ -148,6 +148,23 @@ if uplinkRF
     retransmitServer = dvbs2TCPServerRetry(config.retransmitHost, config.retransmitPort, ...
         "S2a's retransmit-request server");
 
+    % BLOCK HERE UNTIL S3 CONNECTS, the same way S1a/S1b already block on
+    % their own servers before doing any real work. Without this, S2a's
+    % main loop (below) starts relaying real downlink acquisition chunks
+    % to S2b the moment S2b's server answers -- regardless of whether S3
+    % (last in the launch order, so typically the slowest to be ready) has
+    % connected yet at all. S2b's own frame-hand-off connect to S3 already
+    % blocks S2b's *script* from reaching its main loop until S3 answers,
+    % but that did nothing to stop S2a from racing ahead and building up a
+    % backlog in the meantime -- this closes that gap from S2a's side too,
+    % so the receive chain (S2a/S2b/S3) only starts actually working once
+    % every part of it, including S3, is genuinely ready.
+    fprintf('S2a: waiting for S3 to connect to the retransmit-request listener ...\n');
+    while ~retransmitServer.Connected
+        pause(0.1);
+    end
+    fprintf('S2a: S3 connected.\n');
+
     radioUplinkTx = comm.SDRuTransmitter( ...
         'Platform', config.usrp.platform, ...
         'IPAddress', u.txIPAddress, ...

@@ -55,10 +55,15 @@ $scripts = @(
 # processes cold-starting within ~4.5 s of each other produced 214 RX
 # overruns, 25 TX underruns and 10.8% frame loss, none of it from a code bug
 # -- purely from four license checks / JIT compiles / USRP driver inits
-# competing for the same CPU cores at once. 15 s spaces that out so each
-# process's expensive one-time startup cost has mostly settled before the
-# next one begins competing for it.
-$staggerSeconds = 15
+# competing for the same CPU cores at once. Originally set to 15 s;
+# lowered to 5 s on 2026-09-11 now that every process blocks on its own
+# downstream connections before doing real work (S1a/S1b already did;
+# S2a now also waits for S3 -- see its own comment), which bounds how much
+# a fast-starting process can race ahead of a slow one regardless of the
+# stagger value. Revisit this number (back up towards 15s) if RX/TX
+# over/underruns climb again on a cold start -- that would mean 5 s isn't
+# enough headroom for the license-check/JIT contention this was for.
+$staggerSeconds = 5
 
 # ---------------------------------------------------------------------
 # Locate matlab.exe. Prefers whatever is already on PATH; falls back to

@@ -132,6 +132,16 @@ uplinkUnderruns = 0;
 % symptom of the forward link losing frames.
 uplinkFeedbackCount = 0;
 uplinkRetransmitCount = 0;
+% Diagnostics for config.uplink.txBudgetFraction (see ccsdsUplinkTxStream.m):
+% how deep the real-CLTU queue is right now, the measured cost of encoding
+% one, and how many calls have had to hold queued CLTUs back this run
+% because the budget was already spent. A growing queue depth alongside a
+% climbing capped count means the budget is too tight for the current
+% retransmit/feedback traffic -- worth widening; RX overruns climbing
+% instead means it is still too loose.
+uplinkQueueDepth = 0;
+uplinkSecPerCltu = 0;
+uplinkBudgetCappedCount = 0;
 if uplinkRF
     u = config.uplink;
 
@@ -236,9 +246,13 @@ while true
             wall - accounted, 100*(wall - accounted)/wall);
         fprintf('  --\n  RX overruns %d | uplink %d CLTUs sent, %d underruns\n', ...
             overrunCount, uplinkTxCount, uplinkUnderruns);
-        fprintf('  uplink payloads: %d channel reports + %d retransmit requests = %d\n\n', ...
+        fprintf('  uplink payloads: %d channel reports + %d retransmit requests = %d\n', ...
             uplinkFeedbackCount, uplinkRetransmitCount, ...
             uplinkFeedbackCount + uplinkRetransmitCount);
+        fprintf(['  uplink CLTU budget (config.uplink.txBudgetFraction=%.2f): ' ...
+            'capped %d of %d chunks, %.1f ms/CLTU measured, %d still queued at end\n\n'], ...
+            config.uplink.txBudgetFraction, uplinkBudgetCappedCount, chunkNum, ...
+            1e3*uplinkSecPerCltu, uplinkQueueDepth);
         break;
     end
     prof.iters = prof.iters + 1;
@@ -372,9 +386,11 @@ while true
                 % port-binding problem.
                 fprintf(['S2a: chunk %d | RSSI=%.2f dB | rawCFO=%.1f Hz | %d blocks | ' ...
                     'overruns %d | uplink %d sent, %d underruns | ' ...
+                    'CLTU queue %d (%.1f ms/CLTU, capped %d) | ' ...
                     'rt srv conn=%d bytes=%d | RT factor %.3f\n'], ...
                     chunkNum, rssiDB, cfoEstHz, blockNum, overrunCount, ...
                     uplinkTxCount, uplinkUnderruns, ...
+                    uplinkQueueDepth, 1e3*uplinkSecPerCltu, uplinkBudgetCappedCount, ...
                     retransmitServer.Connected, retransmitServer.NumBytesAvailable, ...
                     toc(runTic)/max(airtimeSec,eps));
             else
@@ -424,6 +440,11 @@ while true
         [uplinkBlock, uplinkInfo] = ccsdsUplinkTxStream( ...
             config.uplink.txBlockSamples, newPayloads, config);
         uplinkTxCount = uplinkInfo.cltusSent;
+        uplinkQueueDepth = uplinkInfo.queued;
+        uplinkSecPerCltu = uplinkInfo.secPerCltu;
+        if uplinkInfo.cltuBudgetCapped
+            uplinkBudgetCappedCount = uplinkBudgetCappedCount + 1;
+        end
 
         % An underrun here is a real hole in a carrier that is supposed to
         % be continuous, so it is counted rather than ignored. A steadily

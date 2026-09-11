@@ -417,6 +417,28 @@ config.uplink.plop.minIdleSymbols = 24;
 % waiting, only the idle still owed by minIdleSymbols is emitted.
 config.uplink.plop.idleChunkSymbols = 256;
 
+% Fraction of one uplink TX block's own airtime that ccsdsUplinkTxStream.m
+% may spend generating REAL (LDPC-encoded) CLTUs before falling back to
+% idle for the rest -- the same genBudgetFraction pattern S1b already uses
+% for the downlink waveform, applied here for the same reason: a real CLTU
+% costs meaningfully more to generate than idle filler of the same length,
+% and that cost scales with retransmit/feedback TRAFFIC -- exactly what
+% climbs when the forward link is already struggling. Left uncapped,
+% measured directly on hardware: uplink TX consumed 76.2% of S2a's wall
+% time in one run under heavy retransmit load, and RX overruns on the
+% downlink radio reached 1200 (versus under 200 in a lightly-loaded run) --
+% S2a fell behind draining its OWN receive radio because generating the
+% uplink relay traffic was eating the time budget that drain needed. That
+% in turn corrupts what S2b receives, causing MORE frame loss, MORE
+% retransmit requests, and MORE uplink relay traffic -- a closed feedback
+% loop with no self-correction. This caps it at the source: whichever
+% CLTUs don't fit the budget this call simply wait in the queue for the
+% next one, rather than making every call more expensive right when the
+% system can least afford it. STARTING VALUE, NOT A TUNED RESULT -- same
+% caveat as config.tx.genBudgetFraction's own history; watch S2a's RX
+% overruns and S1a's TX underruns/uplink RX overruns after changing this.
+config.uplink.txBudgetFraction = 0.35;
+
 % First bit of the acquisition and idle patterns. CCSDS allows either; both
 % give the same alternating sequence, offset by one symbol.
 config.uplink.plop.startBit = 0;

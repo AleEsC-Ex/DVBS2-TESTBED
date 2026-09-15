@@ -58,7 +58,7 @@ $scripts = @(
 # competing for the same CPU cores at once. 15 s spaces that out so each
 # process's expensive one-time startup cost has mostly settled before the
 # next one begins competing for it.
-$staggerSeconds = 15
+$staggerSeconds = 1
 
 # ---------------------------------------------------------------------
 # Locate matlab.exe. Prefers whatever is already on PATH; falls back to

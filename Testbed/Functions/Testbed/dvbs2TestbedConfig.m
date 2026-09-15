@@ -223,7 +223,7 @@ config.burstFrames = 4;   % retained for reference only; nothing reads it
 % acquisition-only loop's cost, once decoupled from the DSP chain),
 % with margin below it so chunks come back fully valid rather than
 % truncated.
-config.chunkLength = floor(66564/2);
+config.chunkLength = floor(2*66564/config.dvbs2.SamplesPerSymbol);   % samples, not symbols
 % Samples S2b_Reciever.m's DSP loop reads per iteration from the RF
 % acquisition stream (config.useSDR only) -- deliberately decoupled from
 % config.chunkLength above (which sizes the acquisition process's own
@@ -263,7 +263,7 @@ config.chunkLength = floor(66564/2);
 % filter and symbol-synchroniser objects release whenever the input length
 % changes. That is why it must stay FIXED at runtime -- varying it would
 % re-lock on every change -- but a different constant is free.
-config.rfAcqReadChunkLength = 66564;
+config.rfAcqReadChunkLength = 2*66564;
 
 %% Uplink: CCSDS Telecommand (Functions/Uplink/, sdr_test/UplinkTx+UplinkRx)
 % Carries ACM feedback and ARQ retransmit requests from the receiving side
@@ -350,8 +350,8 @@ config.uplink.sampleRate = config.usrp.masterClockRate / config.uplink.inter_dec
 % CLTU at 40 ms, over which the ~190 Hz/s Doppler rate at 500 MHz changes
 % the offset by under 8 Hz -- negligible -- while keeping occupied bandwidth
 % to about 11 kHz.
-config.uplink.symbolRate = 8000;
-config.uplink.samplesPerSymbol = config.uplink.sampleRate / config.uplink.symbolRate;   % 25
+config.uplink.symbolRate = 20e3;
+config.uplink.samplesPerSymbol = config.uplink.sampleRate / config.uplink.symbolRate;
 
 % Pulse shaping. Needed now, and NOT needed before: PCM/PSK/PM was band
 % limited by its own subcarrier, whereas raw BPSK symbols are rectangular
@@ -440,15 +440,10 @@ config.uplink.plop.startBit = 0;
 % underruns, putting a hole in a carrier that is supposed to be continuous.
 % Watch BOTH counters in S2a's log and adjust from what they say.
 %
-% DERIVED, AND DELIBERATELY ROUNDED DOWN. A hardcoded 10000 came out at
-% 1.0015x the downlink chunk duration -- only 0.15% over, but over is the
-% dangerous side: the surplus accumulates in the transmit buffer until
-% radioTx() blocks to regulate it, at which point the UPLINK is pacing the
-% loop and the downlink overruns. Rounding down instead leaves a ~20
-% sample/second deficit, which costs one brief underrun every few minutes
-% in a carrier that is 96% idle anyway. Cheap failure versus expensive one.
-config.uplink.txBlockSamples = floor(config.chunkLength / config.usrp.sampleRate ...
-    * config.uplink.sampleRate);
+% SIZED TO COVER FOUR CLTU + MINIMUM IDLE, so the radio never starves, this
+% allow that the uplink is continuously transmitting a coherent amount of data,
+% without starving/collapsing the whole S2a loop. The 320-symbol CLTU is the largest one the uplink can carry.
+config.uplink.txBlockSamples = (320+config.uplink.plop.minIdleSymbols)*config.uplink.samplesPerSymbol;   % 320 symbols, 50 sps
 
 % Target RMS amplitude of the continuous transmitted stream.
 %
@@ -587,8 +582,8 @@ config.uplink.ldpcMaxIterations = 50;
 % ccsdsUplinkReceive.m checks this containment at run time rather than
 % trusting the arithmetic here, since the CLTU length depends on the coding
 % and codeword length and this file does not own those.
-config.uplink.searchWindowSamples = 12000;
-config.uplink.searchStrideSamples = 4000;
+config.uplink.searchWindowSamples = 320*config.uplink.samplesPerSymbol*1.5; %24000
+config.uplink.searchStrideSamples = config.uplink.searchWindowSamples/3; %8000
 
 % STAGE 2 gate, in dB: the strongest peak of the SQUARED signal's spectrum
 % relative to that spectrum's median, inside +-2*maxCarrierOffsetHz.
@@ -1105,9 +1100,9 @@ config.calibLockFramesRequired = 5;
 % sigma is itself inflated by the outlier being looked for.
 config.acm.outlierMADs = 4;
 
-config.acm.reportDeltaMeanDB = 0.5;    % half a MODCOD rung
-config.acm.reportDeltaSigmaDB = 0.5;
-config.acm.heartbeatSec = 2.0;
+config.acm.reportDeltaMeanDB = 1;    % half a MODCOD rung
+config.acm.reportDeltaSigmaDB = 1.5;
+config.acm.heartbeatSec = 3.0;
 
 % Minimum frames in a batch before a CHANGE trigger may fire. The heartbeat
 % is exempt -- it must prove liveness on schedule regardless.
@@ -1123,21 +1118,20 @@ config.acm.heartbeatSec = 2.0;
 % outlierMADs above is supposed to catch exactly this, but a batch of one
 % has no median absolute deviation to measure against. Three frames is the
 % smallest batch where a MAD means anything.
-config.acm.minFramesForChangeReport = 3;
+config.acm.minFramesForChangeReport = 5;
 
 % The transmitter declares the return link lost after this long with no
 % message of any kind (feedback OR an ARQ request -- both prove liveness).
-% Set to tolerate one lost heartbeat: 2 s heartbeat, 5 s timeout.
+% Set to tolerate one lost heartbeat: 3 s heartbeat, 5 s timeout.
 %
 % A lost change-triggered report is the one real weakness of event-driven
 % reporting -- the transmitter cannot know it missed anything. The heartbeat
-% bounds the damage: worst case the transmitter is stale by one heartbeat,
-% which at 0.09 dB/s is 0.18 dB.
+% bounds the damage.
 config.acm.linkLossSec = 5.0;
 
 % Rolling window of feedback reports the policy combines, and the minimum
-% number of them before a trend is trusted. Ten reports at a 2 s heartbeat
-% spans about 20 s, comfortably longer than the 7-13 s a MODCOD step takes.
+% number of them before a trend is trusted. Ten reports at a 3 s heartbeat
+% spans about 30 s, comfortably longer than the 7-13 s a MODCOD step takes.
 config.acm.batchWindow = 10;
 config.acm.trendMinBatches = 4;
 % Seconds ahead the fitted slope is extrapolated when it is falling.
@@ -1220,7 +1214,7 @@ config.maxFrames = Inf;
 % the USRP's LO leakage with nothing being fed to it, not a fault. Expect a
 % tail of "DECODED NOTHING" heartbeats at the end of S2b's log equal to
 % however long S1a was started ahead of the receivers.
-config.runDurationSec = 120;
+config.runDurationSec = 420;
 
 end
 

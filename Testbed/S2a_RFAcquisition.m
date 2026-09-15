@@ -112,12 +112,6 @@ fprintf('S2a: connected to S2b.\n');
 % the two servers S1a used to host, and relays whatever arrives on them over
 % the 500 MHz uplink.
 %
-% S2B AND S3 ARE UNCHANGED BY THIS. They still connect to
-% config.feedbackHost:feedbackPort and config.retransmitHost:retransmitPort
-% exactly as before -- only which process BINDS those ports moves. Neither
-% has any idea whether its bytes go over loopback or over the air, which is
-% the whole reason the ports were specified this way.
-%
 % NO RE-SERIALISATION HAPPENS HERE. S2b sends dvbs2SerializeFeedback bytes
 % and S3 sends dvbs2SerializeRetransmitRequest bytes; both are 5 bytes and
 % both fit one LDPC(128,64) codeword's 64 information bits. They are handed

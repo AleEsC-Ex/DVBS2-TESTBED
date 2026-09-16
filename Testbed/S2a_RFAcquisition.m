@@ -1,55 +1,4 @@
-%S2A_RFACQUISITION Acquisition + receive front end, feeding S2b_Reciever.m's DSP process.
-%
-%   This process owns everything between "where samples come from" and
-%   "symbol-domain DSP", for BOTH testbed modes:
-%
-%     config.useSDR = true   samples come from the USRP via radioRx().
-%     config.useSDR = false  samples arrive from S1a_Transmitter.m as a
-%                            clean transmitted waveform, and THIS process
-%                            applies the simulated channel impairment
-%                            model (Functions/configureDVBS2Channel.m).
-%
-%   Putting the channel model here rather than in S1a mirrors the real
-%   hardware split: in SDR mode S1a hands its waveform to the radio and
-%   everything downstream of that -- propagation, front-end effects --
-%   belongs to the receiving side. Sim mode now has the same shape, so
-%   the two modes differ only in this script's acquisition step and not
-%   in the pipeline's structure.
-%
-%   After acquisition it runs the per-sample front-end stages that used
-%   to live in S2b_Reciever.m:
-%     1) DC blocking (SDR only -- LO leakage has no simulated analog)
-%     2) RSSI, measured BEFORE AGC (AGC deliberately erases absolute
-%        power information, so it can only be measured here)
-%     3) AGC
-%     4) Raw-sample-domain coarse CFO compensation
-%        (Functions/dvbs2RawCFOCompensate.m) -- a feed-forward BLOCK
-%        estimate with no state carried between calls, applied to the
-%        assembled chunk immediately before it is sent, which is exactly
-%        where S2b used to apply it. It has to stay ahead of the matched
-%        filter (see that function's header for why), and the matched
-%        filter is the first thing S2b does, so this is still the last
-%        possible point for it.
-%   and forwards the result to S2b_Reciever.m as one framed message per
-%   block (Functions/Serialization/dvbs2SerializeAcqChunk.m), carrying
-%   the samples together with the RSSI and CFO estimate measured for them.
-%
-%   WHY THE SPLIT IS HERE: these stages are all streaming and
-%   chunk-boundary-safe (each carries its own state across calls), so
-%   they can run in this process without changing their results, while
-%   everything from the matched filter onward needs the cross-chunk
-%   symbol buffer that S2b_Reciever.m owns. Moving them off S2b also halves
-%   nothing on its own -- the point is that this process was measured at
-%   ~1.5% of real time, i.e. almost entirely idle, while S2b carries the
-%   bulk of the pipeline's cost.
-%
-%   Blocks are accumulated to config.rfAcqReadChunkLength before being
-%   sent, so S2b's DSP chunk size stays exactly what it was regardless of
-%   how many samples each individual acquisition call returns -- the
-%   radio is still drained as fast as radioRx() will allow.
-%
-%   Run alongside S1a_Transmitter.m/S2b_Reciever.m/S3_ProcessingUnit.m,
-%   in any order.
+% S2A_RFACQUISITION Acquisition + receive front end, feeding S2b_Reciever.m's DSP process.
 
 clear; clc;
 
@@ -57,9 +6,7 @@ addpath(genpath(fullfile(fileparts(mfilename('fullpath')), 'Functions')));
 
 config = dvbs2TestbedConfig();
 
-% Reset the persistent state of the stateful front-end stages, so a fresh
-% run doesn't inherit a DC-blocker or channel-model CFO phase from a
-% previous run in the same MATLAB session.
+% Reset the persistent state of the stateful front-end stages, so a fresh.
 clear dvbs2DCBlock;
 clear configureDVBS2Channel;
 clear dvbs2RawCFOCompensate;
@@ -92,10 +39,7 @@ else
     end
     fprintf('S2a: S1a connected.\n');
 
-    % configureDVBS2Channel only reads SamplesPerSymbol and RolloffFactor
-    % off its cfgDVBS2 argument, so a plain struct stands in for the full
-    % waveform-generator System object (which belongs to S1a and has no
-    % reason to exist in this process).
+% configureDVBS2Channel only reads SamplesPerSymbol and RolloffFactor.
     cfgForChannel.SamplesPerSymbol = config.dvbs2.SamplesPerSymbol;
     cfgForChannel.RolloffFactor = config.dvbs2.RolloffFactor;
     simParams = config.simChannel;
@@ -108,35 +52,16 @@ acqClient = dvbs2TCPConnectRetry(config.rfAcqHost, config.rfAcqPort, "S2b's RF a
 fprintf('S2a: connected to S2b.\n');
 
 %% RF uplink transmitter (config.uplink.useRF only)
-% S2a becomes the gateway for everything travelling back to S1a. It hosts
-% the two servers S1a used to host, and relays whatever arrives on them over
-% the 500 MHz uplink.
-%
-% S2B AND S3 ARE UNCHANGED BY THIS. They still connect to
-% config.feedbackHost:feedbackPort and config.retransmitHost:retransmitPort
-% exactly as before -- only which process BINDS those ports moves. Neither
-% has any idea whether its bytes go over loopback or over the air, which is
-% the whole reason the ports were specified this way.
-%
-% NO RE-SERIALISATION HAPPENS HERE. S2b sends dvbs2SerializeFeedback bytes
-% and S3 sends dvbs2SerializeRetransmitRequest bytes; both are 5 bytes and
-% both fit one LDPC(128,64) codeword's 64 information bits. They are handed
-% to the uplink verbatim and arrive at S1a as the same 5 bytes, so S1a can
-% deserialize them with the functions it already uses. The uplink is a
-% transparent pipe, not a protocol layer.
 uplinkRF = config.useSDR && config.uplink.useRF;
 uplinkTxCount = 0;
 uplinkUnderruns = 0;
-% Split of what the uplink actually carried. Channel reports are periodic
-% ACM feedback from S2b; retransmit requests are ARQ from S3 and are the
-% symptom of the forward link losing frames.
+% Split of what the uplink actually carried. Channel reports are periodic.
 uplinkFeedbackCount = 0;
 uplinkRetransmitCount = 0;
 if uplinkRF
     u = config.uplink;
 
-    % Both hold state across calls -- the sample buffer and the shaping
-    % filter's memory.
+% Both hold state across calls -- the sample buffer and the shaping.
     clear ccsdsUplinkTxStream ccsdsUplinkPulseShape;
 
     fprintf('S2a: opening ACM feedback listener on port %d (relayed over RF uplink) ...\n', ...
@@ -163,25 +88,15 @@ end
 
 %% Front-end state
 agc = comm.AGC;
-% comm.AGC locks its expected input length on first call and errors on a
-% later call with a different length unless released first -- track it,
-% since an acquisition block's length can vary (comm.SDRuReceiver's valid
-% sample count, or the simulated channel's SCO resampling stage).
+% comm.AGC locks its expected input length on first call and errors on a.
 agcInputLen = [];
 
 % Samples awaiting emission, accumulated until a full DSP chunk is ready.
 outBuf = [];
-% Raw (pre-AGC) power accumulated over the acquisition blocks feeding the
-% chunk currently being assembled. Summing power here rather than keeping
-% a second copy of the pre-AGC samples keeps this O(1) in memory; the
-% only cost is that a chunk's RSSI covers exactly the acquisition blocks
-% that contributed to it, whose boundaries need not align perfectly with
-% the emitted chunk's. RSSI is a slow-moving relative dB figure, so that
-% boundary difference is immaterial.
+% Raw (pre-AGC) power accumulated over the acquisition blocks feeding the.
 powerSum = 0;
 powerCount = 0;
-% Last RSSI actually measured, reused by a chunk that the accumulator had
-% already been emptied for -- see the emit loop below.
+% Last RSSI actually measured, reused by a chunk that the accumulator had.
 lastRSSIdB = NaN;
 
 fprintf('\nS2a: starting acquisition loop ...\n');
@@ -190,16 +105,11 @@ chunkNum = 0;
 blockNum = 0;
 overrunCount = 0;
 
-% Real-time accounting: airtimeSec is how many seconds of RF this process
-% has handled, wall-clock is how long it took. Their ratio is the
-% real-time factor -- below 1.0 means this process keeps up with the
-% radio, above 1.0 means it cannot and samples are being lost upstream
-% (a USRP overrun in SDR mode, TCP backpressure in sim mode).
+% Real-time accounting: airtimeSec is how many seconds of RF this process.
 runTic = tic;
 airtimeSec = 0;
 
-% Same split as S1a's: seconds spent inside each specific call, so a blocking
-% radio can be told apart from expensive processing.
+% Same split as S1a's: seconds spent inside each specific call, so a blocking.
 prof = struct('radioRx', 0, 'frontEnd', 0, 'tcpOut', 0, 'uplinkTx', 0, 'iters', 0);
 
 while true
@@ -226,17 +136,7 @@ while true
     end
     prof.iters = prof.iters + 1;
 
-    % Yield to MATLAB's event queue before the blocking radio call below.
-    % tcpserver accepts its client ASYNCHRONOUSLY, and that accept is only
-    % processed when the event queue is serviced -- see S1a's identical
-    % comment for the full mechanism. This loop never yielded on its own
-    % (radioRx() blocks inside a MEX call), which is why
-    % retransmitServer.Connected stayed false for an ENTIRE run on hardware
-    % even as bytes visibly piled up in its buffer (NumBytesAvailable
-    % climbing while Connected read 0): S3's connection request, which
-    % only arrives well into the run once S3 first detects a gap, was never
-    % being accepted. Zero retransmit requests were relayed the whole run
-    % as a result. 'limitrate' caps this at roughly 20 Hz, matching S1a/S1b.
+% Yield to MATLAB's event queue before the blocking radio call below.
     drawnow limitrate;
 
     %% 1. Acquire one block of raw samples
@@ -263,17 +163,13 @@ while true
         rawBytes = read(simChannelServer, bytesPerBlock, 'uint8');
         newSamples = dvbs2BytesToComplex(rawBytes);
 
-        % Apply the simulated channel here, where a real receiver would
-        % instead be seeing the effects of the actual RF path.
+% Apply the simulated channel here, where a real receiver would.
         newSamples = configureDVBS2Channel(newSamples, cfgForChannel, simParams);
     end
     blockNum = blockNum + 1;
     airtimeSec = airtimeSec + numel(newSamples)/Fsamp;
 
     %% 2. DC block (SDR only)
-    % LO leakage in the USRP's direct-conversion front end puts a large
-    % spurious spike at exactly 0 Hz that otherwise dominates RSSI and
-    % every downstream stage. The simulated channel has no such artifact.
     tFE = tic;
     if config.useSDR
         newSamples = dvbs2DCBlock(newSamples);
@@ -297,15 +193,7 @@ while true
         block = outBuf(1:config.rfAcqReadChunkLength);
         outBuf(1:config.rfAcqReadChunkLength) = [];
 
-        % One acquisition block can fill MORE THAN ONE DSP chunk (100000
-        % samples covers 1.5 chunks of 66564), and the accumulator is
-        % emptied by the first of them -- so the second had powerCount = 0
-        % and reported 10*log10(0) = -Inf. That is not a harmless log
-        % artifact: it travelled into the ACM report, where the serializer
-        % clamped it to -96 dB, so every other feedback message claimed the
-        % signal had vanished. Carry the last real measurement instead;
-        % RSSI is a slow-moving figure and the samples in question were
-        % genuinely covered by it.
+% One acquisition block can fill MORE THAN ONE DSP chunk (100000.
         if powerCount > 0
             rssiDB = 10*log10(powerSum / powerCount);
             lastRSSIdB = rssiDB;
@@ -315,22 +203,9 @@ while true
             rssiDB = lastRSSIdB;
         end
 
-        % Raw-sample-domain coarse CFO compensation. Applied to the whole
-        % assembled chunk (not per acquisition block) so the estimate
-        % covers exactly the same span it did when this ran in S2b.
+% Raw-sample-domain coarse CFO compensation. Applied to the whole.
         tOut = tic;
-        % Blind coarse CFO, applied to the whole assembled chunk (not per
-        % acquisition block) so the estimate covers exactly the same span it
-        % did when this ran in S2b.
-        %
-        % OFF BY DEFAULT -- see config.rawCFOEnabled for the full reasoning.
-        % In short: the M-th power estimator has to be told the modulation,
-        % which S2a cannot know, and it produces wild values near its own
-        % +-83 kHz ambiguity edge. One such chunk unlocks S2b's timing loop
-        % permanently. Reporting zero is not a fudge: S2b adds this to its own
-        % SOF-based estimate and subtracts it back out when applying, so a
-        % zero simply hands the whole job to the estimator that can measure
-        % it unambiguously.
+% Blind coarse CFO, applied to the whole assembled chunk (not per.
         if config.rawCFOEnabled
             [block, cfoEstHz] = dvbs2RawCFOCompensate(block, Fsamp, "QPSK", ...
                 config.rawCFOResolutionHz);
@@ -344,15 +219,7 @@ while true
         chunkNum = chunkNum + 1;
         if mod(chunkNum, 10) == 0
             if uplinkRF
-                % rtSrv/rtBytes are diagnostic -- kept because they are what
-                % actually diagnosed the root cause: this loop never yielded
-                % to MATLAB's event queue (see the drawnow above), so
-                % retransmitServer's async client accept was never
-                % processed. conn stayed 0 for a whole run while bytes
-                % climbed anyway (OS-level data arriving, MATLAB object
-                % never latching Connected), which is exactly what pointed
-                % at the missing drawnow rather than a message-format or
-                % port-binding problem.
+% rtSrv/rtBytes are diagnostic -- kept because they are what.
                 fprintf(['S2a: chunk %d | RSSI=%.2f dB | rawCFO=%.1f Hz | %d blocks | ' ...
                     'overruns %d | uplink %d sent, %d underruns | ' ...
                     'rt srv conn=%d bytes=%d | RT factor %.3f\n'], ...
@@ -368,26 +235,10 @@ while true
     end
 
     %% 6. Keep the RF uplink fed
-    % LAST IN THE LOOP, AND EXACTLY ONE BLOCK PER ITERATION. This loop is
-    % paced by radioRx(), which returns one chunkLength of downlink airtime
-    % per call; txBlockSamples is sized to the same duration, so pushing one
-    % block per iteration keeps the uplink running at real time without
-    % either radio pulling ahead of the other.
-    %
-    % It goes last so the downlink drain and the hand-off to S2b -- both on a
-    % hard deadline -- happen before this can block on the uplink radio.
     if uplinkRF
         newPayloads = {};
 
-        % Anything queued on either server goes out verbatim. Both message
-        % types share one uplink, which is what dvbs2MessageType's 3-bit
-        % type field at the head of every message is for.
-        % Counted separately as they are queued. The total CLTU count alone
-        % cannot distinguish a healthy link -- where almost all uplink
-        % traffic is periodic channel reports -- from a struggling one,
-        % where retransmit requests dominate because S3 keeps finding gaps.
-        % Both share one carrier, so the split is only visible here, at the
-        % point the two servers are drained.
+% Anything queued on either server goes out verbatim. Both message.
         if feedbackServer.Connected
             fbBytes = dvbs2TCPFrameTryRead(feedbackServer);
             if ~isempty(fbBytes)
@@ -408,10 +259,7 @@ while true
             config.uplink.txBlockSamples, newPayloads, config);
         uplinkTxCount = uplinkInfo.cltusSent;
 
-        % An underrun here is a real hole in a carrier that is supposed to
-        % be continuous, so it is counted rather than ignored. A steadily
-        % climbing count means txBlockSamples is too small for this loop's
-        % actual cadence; RX overruns climbing instead means it is too big.
+% An underrun here is a real hole in a carrier that is supposed to.
         if radioUplinkTx(uplinkBlock)
             uplinkUnderruns = uplinkUnderruns + 1;
         end

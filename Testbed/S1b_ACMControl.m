@@ -1,61 +1,39 @@
 %S1B_ACMCONTROL Waveform generation, ACM control, and uplink command decode.
 %
-%   Owns everything S1a_Transmitter.m does not: the DVB-S2 waveform
-%   generator, the transmit FIFO, the selective-repeat ARQ retransmit
-%   queue, and ACM policy (Functions/dvbs2ACMPolicy.m). S1a is left with
-%   only what genuinely cannot move: the two radios themselves, which
-%   share one IP and so must stay in one process.
+%   Owns the DVB-S2 waveform generator, the transmit FIFO, the
+%   selective-repeat ARQ retransmit queue, and the ACM policy
+%   (Functions/dvbs2ACMPolicy.m). S1a keeps only what can't move: the two
+%   radios, which share one IP and must stay in one process.
 %
-%   UPLINK: ONLY STAGES 6-8 LIVE HERE NOW. S1a runs CCSDS uplink
-%   acquisition (Functions/Uplink/ccsdsUplinkAcquire.m, stages 1-5 -- DC
-%   suppress through Costas tracking) on the continuous raw uplink stream,
-%   close to the radio, and forwards only the CLTUs that actually clear
-%   the ASM correlation. This process receives those (already
-%   Costas-tracked, already timing/phase-aligned) codeword symbols over
-%   config.uplinkAcqPort and runs just derandomize + LDPC decode
-%   (Functions/Uplink/ccsdsUplinkDecodeCodeblock.m) on each -- a discrete,
-%   occasional decode, not a continuous-stream DSP problem, which is
-%   exactly why it was worth splitting off from acquisition in the first
-%   place. See S1a_Transmitter.m's own docstring for the full reasoning.
+%   UPLINK: only stages 6-8 (derandomize + LDPC decode,
+%   Functions/Uplink/ccsdsUplinkDecodeCodeblock.m) run here. S1a runs
+%   acquisition (stages 1-5, Functions/Uplink/ccsdsUplinkAcquire.m) close
+%   to the radio and forwards only CLTUs that clear ASM correlation --
+%   already Costas-tracked and timing/phase-aligned -- so this process
+%   handles a discrete, occasional decode, not continuous-stream DSP.
 %
-%   WHY GENERATION MOVED HERE TOO, WHEN THE FIRST VERSION OF THIS SPLIT
-%   DELIBERATELY LEFT IT IN S1a. That first version only moved uplink
-%   recovery and ACM control, on the reasoning that generation carried a
-%   real pacing risk (see below) not worth taking on for a modest CPU
-%   saving. Measured on hardware, that version made things WORSE, not
-%   better: MODCOD oscillated (19->22->19, 24->21->19->13 in a handful of
-%   reports) and frame loss rose to 13.2%, because splitting the process
-%   ALSO split off the accidental debounce that S1's own ~400ms
-%   generate-then-transmit cadence used to provide -- ACM feedback that
-%   used to get naturally batched down to "one decision per iteration"
-%   was suddenly reaching dvbs2ACMPolicy.m individually, and a single bad
-%   SNR reading (dvbs2SNREstimate.m misfires on ~4% of frames, a known,
-%   already-documented failure mode) was enough to trigger an
+%   PACING. This process never calls radioTx(), so unlike the old
+%   single-process design it has no built-in real-time clock, and TCP
+%   backpressure isn't a substitute (a txBlockSamples block is close to
+%   or larger than a typical socket buffer, giving a bursty rhythm, not a
+%   smooth one). So the loop paces itself explicitly: after sending each
+%   block, it waits out whatever remains of
+%   config.tx.blockSamples/config.usrp.sampleRate before generating the
+%   next one.
+%
+%   WHY GENERATION LIVES HERE, NOT IN S1a. An earlier version left
+%   generation in S1a and moved only ACM/uplink recovery here, to avoid
+%   the pacing risk above for a modest CPU saving. On hardware this
+%   performed worse: MODCOD oscillated and frame loss rose to 13.2%,
+%   because splitting the process also removed the incidental debouncing
+%   the old ~400 ms generate-then-transmit cadence provided -- individual
+%   SNR readings (dvbs2SNREstimate.m misfires on ~4% of frames) started
+%   reaching dvbs2ACMPolicy.m unbatched, each able to trigger an
 %   unprotected multi-rung drop (agreeCountDown=1, minDwellSecDown=0, by
-%   design, so a genuinely collapsing link can react in one decision).
-%   Moving generation here and giving it its own explicit wall-clock
-%   pacer (below) restores that same ~400ms cadence deliberately instead
-%   of accidentally, which fixes both problems with one mechanism: ACM
-%   evaluation is debounced again, AND the CPU-sharing benefit that was
-%   the actual point of this split is now real instead of marginal.
-%
-%   THE PACING RISK, AND HOW IT'S HANDLED. radioTx() used to be a
-%   BLOCKING call, and its blocking was what paced the whole loop to real
-%   time -- generation never needed its own clock because it was
-%   downstream of something that already had one. Move generation to a
-%   process that never touches the radio, and that tick disappears.
-%   TCP's own backpressure is not a substitute: a txBlockSamples block
-%   (a few MB) is close to or larger than a typical OS socket buffer, so
-%   relying on it produces a bursty rhythm -- dump a block, stall on
-%   buffer space, dump again -- not the smooth cadence
-%   config.tx.genBudgetFraction and the dummy-filler ratio were tuned
-%   against. So this loop paces itself explicitly: after sending each
-%   block, it waits out whatever is left of
-%   config.tx.blockSamples/config.usrp.sampleRate before starting the
-%   next one. That is the same tic/toc pacing pattern sim mode always
-%   used against its own unthrottled TCP link -- applied here
-%   unconditionally, in both modes, because in neither mode does this
-%   process touch a radio directly any more.
+%   design, so a genuinely collapsing link can still react in one
+%   decision). Moving generation here, with the explicit pacer above,
+%   restores that debouncing deliberately while keeping the CPU-sharing
+%   benefit the split was for.
 
 clear; clc;
 
@@ -74,18 +52,15 @@ cfgDVBS2.SamplesPerSymbol = config.dvbs2.SamplesPerSymbol;
 cfgDVBS2.RolloffFactor = config.dvbs2.RolloffFactor;
 cfgDVBS2.UPL = config.dvbs2.UPL;
 
-% Sample rate this waveform is produced at -- also the pacing loop's own
-% clock (see the docstring above). Consistent with how config.chanBW is
-% derived: Fsym = chanBW/(1+RolloffFactor) = usrp.sampleRate/SamplesPerSymbol,
-% so Fsym*SamplesPerSymbol is just usrp.sampleRate.
+% Sample rate this waveform is generated at; also the pacing loop's own
+% clock (see docstring above).
 Fsamp = config.usrp.sampleRate;
 
 currentMODCOD = cfgDVBS2.MODCOD;
 
-% Until the first real feedback report proves the link works, transmit
-% calibration bursts at the most robust MODCOD instead of real data --
-% S1a has nothing of its own to decide this with any more, so this flag
-% lives here now and governs what gets GENERATED, not what gets sent.
+% Until the first feedback report proves the link works, transmit
+% calibration bursts at the most robust MODCOD instead of real data.
+% Governs what gets GENERATED, not what gets sent.
 linkEstablished = ~config.useSDR;
 calibMODCOD = 1;
 if config.useSDR
@@ -97,12 +72,10 @@ end
 %% Return-link input: raw uplink samples from S1a (RF mode), or the
 % feedback/retransmit servers hosted directly (TCP/sim mode).
 %
-% OPENED BEFORE THE OUTBOUND CONNECT BELOW, DELIBERATELY -- same reason
-% as S1a's identical reordering. This process's own server(s) must go up
-% before it ever blocks trying to connect to S1a's, or the two processes
-% can deadlock: each waiting on a server the other hasn't reached yet.
-% Measured on hardware with the old ordering (connect first, serve
-% second, symmetric in both files): neither side ever came up.
+% Server opened BEFORE the outbound connect below, deliberately: if both
+% processes connected first and served second, they can deadlock, each
+% waiting on a server the other hasn't opened yet (confirmed on
+% hardware). S1a follows the same ordering for the same reason.
 uplinkRF = config.useSDR && config.uplink.useRF;
 if uplinkRF
     fprintf('S1b: opening uplink acquisition server on port %d, waiting for S1a to connect ...\n', ...
@@ -120,10 +93,9 @@ else
 end
 
 %% TX block output TO S1a
-% S1a hosts (see its own comment for why); this process is the client,
-% retrying until S1a is listening -- and by now S1a's server is either
-% already up or will be shortly, since S1a opens it before it ever tries
-% to connect to the server above, for exactly the same reason.
+% S1a hosts this link; this process is the client, retrying until S1a is
+% listening (S1a opens its server before connecting to the one above, so
+% it's ready by the time this runs).
 fprintf('S1b: connecting to S1a''s TX block server at %s:%d ...\n', ...
     config.txBlockHost, config.txBlockPort);
 txBlockClient = dvbs2TCPConnectRetry( ...
@@ -136,61 +108,42 @@ lastReturnTic = tic;
 returnLinkLost = false;
 uplinkFbQueue = {};
 uplinkRtQueue = {};
-% Note: RX overruns and acquisition-quality figures (carrier level, ASM
-% metric) are S1a-side metrics now, tracked in its own profile -- this
-% process never touches the radio and never runs stages 1-5 any more, only
-% the decode (stages 6-7) of whatever CLTUs S1a already found.
+% RX overruns and acquisition-quality metrics (carrier level, ASM) live
+% in S1a's own profile now -- this process only decodes (stages 6-7)
+% CLTUs S1a already found.
 uplinkDecodes = 0;
 uplinkParityFails = 0;
 uplinkEsNodB = NaN;
-% How many CLTU messages were actually drained and handed to
-% ccsdsUplinkDecodeCodeblock -- compare against S1a's "CLTUs found" count
-% in its own profile. The two should match exactly; a gap means this loop
-% is falling behind S1a's forwarding rate.
+% CLTU messages actually drained and decoded; compare against S1a's
+% "CLTUs found" count -- a gap means this loop is falling behind S1a.
 cltusReceived = 0;
 
-%% Retransmit-request queue -- validated and applied HERE now, because
-% globalPktIdx (below) lives here too: generation and its bookkeeping
-% were never going to be split across the process boundary, only
-% radio I/O was.
+%% Retransmit-request queue -- validated and applied here, since
+% globalPktIdx (below) lives here too.
 retransmitQueue = struct('StartIdx', {}, 'EndIdx', {});
 
 %% Data source setup
 syncByte = de2bi(hex2dec('47'), 8, 'left-msb')';   % MPEG-TS sync byte (0x47), prepended to every packet
 
-% globalPktIdx is a running count of every packet ever transmitted this
-% run, independent of burst/MODCOD boundaries. Each packet's payload
-% embeds its own globalPktIdx (Functions/dvbs2ReferencePacketPayload.m)
-% so the receiving side can independently regenerate the matching
-% reference for bit-for-bit BER comparison from the index alone --
-% deliberately NOT relying on replaying a single long RNG draw sequence
-% in lockstep across processes, which would break under frame loss,
-% reordering, or MinNumPackets changing with MODCOD between bursts.
-% TRANSMIT FIFO -- how this script sends a variable-length waveform
-% through S1a's fixed-length radio block. Unchanged reasoning from
-% before the split: comm.SDRuTransmitter (now in S1a) locks its input
-% size on the first call, so every block sent over txBlockPort has to be
-% exactly config.tx.blockSamples regardless of which MODCOD produced the
-% frames inside it. See localFramesPerBurst/localPLFrameSamples below
-% for the arithmetic that keeps this bounded below one frame.
+% globalPktIdx counts every packet transmitted this run. Each packet
+% embeds its own index (Functions/dvbs2ReferencePacketPayload.m) so the
+% receiver can regenerate the matching reference for BER comparison from
+% the index alone, instead of replaying an RNG sequence in lockstep --
+% which would break under frame loss, reordering, or MinNumPackets
+% changing with MODCOD.
+
+% TRANSMIT FIFO. comm.SDRuTransmitter (in S1a) locks its input size on
+% the first call, so every block sent over txBlockPort must be exactly
+% config.tx.blockSamples regardless of which MODCOD produced the frames
+% inside it. See localFramesPerBurst/localPLFrameSamples below.
 txBlockSamples = config.tx.blockSamples;
 
-% Measured cost of generating one PLFRAME, tracked as a running average and
-% used to decide how many real frames fit in this block's generation budget.
+% Measured per-frame generation cost, tracked as a running average, used
+% to decide how many real frames fit in this block's generation budget.
 genBudgetSec = (txBlockSamples / Fsamp) * config.tx.genBudgetFraction;
 
-% GENERATION STATE, BUNDLED. Everything localGenerateBlock (bottom of this
-% file) reads and updates as it builds one block, packed into one struct
-% so it can be threaded through that function as a single in/out argument
-% instead of a dozen separate ones. globalPktIdx is a running count of
-% every packet ever transmitted this run, independent of burst/MODCOD
-% boundaries -- each packet's payload embeds its own globalPktIdx
-% (Functions/dvbs2ReferencePacketPayload.m) so the receiving side can
-% independently regenerate the matching reference for bit-for-bit BER
-% comparison from the index alone, deliberately NOT relying on replaying a
-% single long RNG draw sequence in lockstep across processes, which would
-% break under frame loss, reordering, or MinNumPackets changing with
-% MODCOD between bursts.
+% Generation state, bundled into one struct so localGenerateBlock (below)
+% can take/return it as a single argument instead of a dozen.
 genState = struct( ...
     'txFifo', complex(zeros(0,1)), ...
     'globalPktIdx', 0, ...
@@ -204,17 +157,15 @@ genState = struct( ...
     'genSecPerFrame', 0.025);
 clear retransmitQueue   % lives in genState.retransmitQueue from here on
 
-% PIPELINE STATE -- one block generated ahead of what's currently being
-% sent, plus how many times a stale one had to be thrown away. See the
-% main loop's own comment, at the point these are used, for the full
-% reasoning.
+% PIPELINE STATE: one block generated ahead of what's being sent, plus a
+% count of stale ones thrown away. See the main loop for the reasoning.
 pendingBlock = [];
 pendingMeta = [];
 blocksDropped = 0;
 genDeadlineMisses = 0;   % ticks where generation+send took longer than one block's own airtime
 
-% Pre-warm the dummy-filler cache -- see dvbs2DummyFiller.m's own comment
-% for why this has to happen before the first block that needs it, not on it.
+% Pre-warm the dummy-filler cache before the first block that needs it
+% (see dvbs2DummyFiller.m).
 dvbs2DummyFiller(txBlockSamples, cfgDVBS2.SamplesPerSymbol, cfgDVBS2.RolloffFactor, 10);
 
 newDataBudgetLogged = false;
@@ -269,13 +220,13 @@ while true
     end
     prof.iters = prof.iters + 1;
 
-    tickTic = tic;   % this iteration's pacing anchor -- see the docstring
+    tickTic = tic;   % this iteration's pacing anchor
 
-    drawnow limitrate;   % service the tcpserver accept queue -- see S1a's identical comment
+    drawnow limitrate;   % service the tcpserver accept queue (see S1a)
 
-    %% Return-link liveness -- reacts locally now (reconfigure cfgDVBS2
-    % directly) instead of sending S1a a message, since this process owns
-    % the generator.
+    %% Return-link liveness -- reacts locally (reconfigure cfgDVBS2
+    % directly) instead of messaging S1a, since this process owns the
+    % generator.
     if linkEstablished
         sinceReturn = toc(lastReturnTic);
         if sinceReturn > config.acm.linkLossSec && ~returnLinkLost
@@ -293,14 +244,11 @@ while true
 
     %% Collect fbBytes/rtBytes, whichever source is in use
     if uplinkRF
-        % DRAIN EVERY CLTU CURRENTLY BUFFERED, not just one. S1a forwards
-        % one message per DETECTED CLTU now (not one per radio read, the
-        % old raw-relay design) -- but a burst of commands can still queue
-        % up several in a row, and the same "read only one per tick"
-        % mistake that used to lose ~90% of raw chunks would just as
-        % easily lose queued CLTUs here. Draining in a tight loop, and
-        % pacing only the GENERATION side below, is what keeps reading
-        % fast while still debouncing ACM evaluation.
+        % Drain every CLTU currently buffered, not just one -- S1a
+        % forwards one message per detected CLTU, and several can queue
+        % up in a burst. Draining in a tight loop (pacing happens only on
+        % the generation side below) keeps reads fast without losing
+        % queued CLTUs.
         cltusThisTick = 0;
         while true
             cltuBytes = dvbs2TCPFrameTryRead(uplinkAcqServer);
@@ -310,9 +258,8 @@ while true
             cltusThisTick = cltusThisTick + 1;
             cltu = dvbs2DeserializeCLTU(cltuBytes);
 
-            % Stages 6 and 7 only -- derandomize, LDPC decode. Acquisition
-            % (stages 1-5) already happened in S1a; see its own docstring
-            % and ccsdsUplinkAcquire.m for why the split lands here.
+            % Stages 6-7 only (derandomize, LDPC decode); acquisition
+            % (stages 1-5) already ran in S1a.
             tDSP = tic;
             [payload, ok, ~] = ccsdsUplinkDecodeCodeblock( ...
                 cltu.codeSyms, cltu.amplitude, cltu.noiseVar, config);
@@ -325,8 +272,8 @@ while true
             end
             uplinkDecodes = uplinkDecodes + 1;
 
-            % One uplink, two message types -- routed on the 3-bit type
-            % field that heads every control message.
+            % One uplink, two message types, routed on the 3-bit type
+            % field heading every control message.
             switch dvbs2MessageType(payload)
                 case 0, uplinkFbQueue{end+1} = payload; %#ok<SAGROW>
                 case 1, uplinkRtQueue{end+1} = payload; %#ok<SAGROW>
@@ -334,17 +281,12 @@ while true
         end
         cltusReceived = cltusReceived + cltusThisTick;
 
-        % FEEDBACK: NEWEST WINS, older ones are discarded -- a report is a
-        % statistical summary of the link right now, so an older one is
-        % misleading, not merely redundant. Retransmit requests are the
-        % opposite: each names different packets, so all are queued.
-        %
-        % THIS ALONE IS NOT WHAT DEBOUNCES ACM EVALUATION ANY MORE -- see
-        % the docstring's explanation of why that used to be true almost
-        % by accident and isn't reliable on its own. The real debounce is
-        % this loop's own pacing tick at the bottom: this queue just
-        % keeps a backlog from building INSIDE one tick, exactly as it
-        % always did.
+        % Feedback: newest wins (a report is a snapshot of the link right
+        % now, an older one is misleading). Retransmit requests: all
+        % queued, since each names different packets. Note: this queue
+        % only prevents a backlog from building WITHIN one tick -- actual
+        % ACM debouncing comes from the pacing tick at the bottom of the
+        % loop.
         if ~isempty(uplinkFbQueue)
             fbBytes = uplinkFbQueue{end};
             uplinkFbQueue = {};
@@ -370,8 +312,7 @@ while true
         end
     end
 
-    %% ACM decision from feedback, if any arrived -- applied directly,
-    % no network hop needed any more.
+    %% ACM decision from feedback, if any arrived -- applied directly.
     if ~isempty(fbBytes)
         feedback = dvbs2DeserializeFeedback(fbBytes);
         lastReturnTic = tic;
@@ -381,10 +322,9 @@ while true
         end
 
         if ~linkEstablished
-            % First feedback ever received -- S2b has proven it's
-            % actually receiving. Pick the starting MODCOD from those
-            % samples' own mean and spread, via the same ladder the
-            % steady-state policy uses, so the two cannot disagree.
+            % First feedback ever received -- pick the starting MODCOD
+            % from its mean/spread via the same ladder the steady-state
+            % policy uses, so the two never disagree.
             bootMu = feedback.MeanSNRdB;
             bootSigma = feedback.SigmaSNRdB;
             bootMODCOD = dvbs2SelectMODCOD(bootMu, bootSigma, 0, NaN, config);
@@ -419,9 +359,7 @@ while true
         end
     end
 
-    %% Retransmit request -> validate and queue. Same checks as before
-    % the split, unchanged -- only WHERE they run moved, following
-    % globalPktIdx.
+    %% Retransmit request -> validate and queue.
     if ~isempty(rtBytes)
         request = dvbs2DeserializeRetransmitRequest(rtBytes);
         lastReturnTic = tic;
@@ -450,15 +388,12 @@ while true
         end
     end
 
-    %% PIPELINE, STAGE 1: drop the pending block if it's gone stale. It
-    % was built for the MODCOD/link-state that was active when it was
-    % generated (either the previous iteration's prefetch, or -- rarely --
-    % the recovery generation just below, right after a switch). If ACM or
-    % the return-link-liveness check above has since moved on, sending it
-    % anyway would push one more block at a MODCOD the policy has already
-    % abandoned -- exactly what config.acm.agreeCountDown=1/minDwellSecDown=0
-    % exists to prevent. Better to throw it away and fall one tick behind
-    % than to violate that guarantee.
+    %% PIPELINE STAGE 1: drop the pending block if stale. It was built
+    % for whichever MODCOD/link-state was active at generation time; if
+    % ACM or the liveness check above has since moved on, sending it
+    % would push a block at a MODCOD the policy already abandoned --
+    % exactly what agreeCountDown=1/minDwellSecDown=0 exists to prevent.
+    % Discard and fall one tick behind rather than violate that.
     if ~isempty(pendingBlock) && ...
             (pendingMeta.MODCOD ~= currentMODCOD || pendingMeta.IsCalibration ~= ~linkEstablished)
         blocksDropped = blocksDropped + 1;
@@ -466,10 +401,9 @@ while true
         pendingMeta = [];
     end
 
-    %% PIPELINE, STAGE 2: recovery generation. Normally pendingBlock was
-    % already filled by last iteration's prefetch (stage 4 below) and this
-    % is a no-op; it only actually runs right after startup or right after
-    % the drop above just emptied it.
+    %% PIPELINE STAGE 2: recovery generation. Normally pendingBlock was
+    % already filled by last iteration's prefetch (stage 4) and this is a
+    % no-op; it only runs after startup or right after stage 1's drop.
     if isempty(pendingBlock)
         [pendingBlock, pendingMeta, genState, genElapsed] = localGenerateBlock( ...
             linkEstablished, currentMODCOD, calibMODCOD, cfgDVBS2, txBlockSamples, ...
@@ -477,14 +411,10 @@ while true
         prof.waveformGen = prof.waveformGen + genElapsed;
     end
 
-    %% PIPELINE, STAGE 3: send whatever is ready. localGenerateBlock
-    % legitimately returns nothing when linked, the new-data budget is
-    % spent, and no retransmit is queued -- that is not an error, it's the
-    % case this whole redesign was built for: rather than block here
-    % waiting for work that was never coming (the old behaviour), just
-    % send nothing this tick. S1a falls back to a local dummy frame on its
-    % own when a tick brings it no block (see its own comment) instead of
-    % stalling the radio.
+    %% PIPELINE STAGE 3: send whatever is ready. An empty pendingBlock
+    % (linked, new-data budget spent, no retransmit queued) is not an
+    % error -- just send nothing this tick. S1a falls back to a local
+    % dummy frame on its own end rather than stalling the radio.
     if ~isempty(pendingBlock)
         txWaveform = pendingBlock;
         sentMeta = pendingMeta;
@@ -525,12 +455,12 @@ while true
         newDataBudgetLogged = true;
     end
 
-    %% PIPELINE, STAGE 4: prefetch the next block now, one tick ahead of
-    % when it's needed. This is the actual point of the whole pipeline: it
-    % decouples "did generation finish before THIS tick's pacing deadline"
-    % from "does S1a get a block on time" by giving generation a full
-    % extra tick of slack to absorb, at the cost of at most one stale
-    % drop (stage 1) whenever ACM moves in that slack window.
+    %% PIPELINE STAGE 4: prefetch the next block one tick ahead of when
+    % it's needed. This is the point of the pipeline: it decouples
+    % "generation finished before this tick's deadline" from "S1a gets a
+    % block on time", giving generation a full extra tick of slack, at
+    % the cost of at most one stale drop (stage 1) if ACM moves during
+    % that slack window.
     if isempty(pendingBlock)
         [pendingBlock, pendingMeta, genState, genElapsed] = localGenerateBlock( ...
             linkEstablished, currentMODCOD, calibMODCOD, cfgDVBS2, txBlockSamples, ...
@@ -538,14 +468,12 @@ while true
         prof.waveformGen = prof.waveformGen + genElapsed;
     end
 
-    %% PACE TO REAL TIME. This tick is what the whole loop now runs on,
-    % replacing radioTx()'s old implicit one -- see the docstring. If
-    % stages 2-4 together took LONGER than the block's own airtime, that
-    % is surfaced separately (genDeadlineMisses) from a downstream TX
-    % underrun in S1a's own profile: this counter says THIS process could
-    % not keep up; S1a's says the radio actually ran dry. They usually
-    % move together but are not the same measurement, and telling them
-    % apart is the point of keeping both.
+    %% PACE TO REAL TIME -- what the loop runs on now instead of
+    % radioTx()'s old implicit pacing. genDeadlineMisses (stages 2-4
+    % together took longer than the block's own airtime) is tracked
+    % separately from S1a's own TX-underrun count: one says this process
+    % couldn't keep up, the other says the radio actually ran dry -- they
+    % usually move together but are not the same measurement.
     elapsed = toc(tickTic);
     target = txBlockSamples / Fsamp;
     if elapsed < target
@@ -565,16 +493,10 @@ function [waveform, meta, st, genElapsed] = localGenerateBlock( ...
     genBudgetSec, config, syncByte, st)
 %LOCALGENERATEBLOCK Build exactly one txBlockSamples-long block, or none.
 %
-%   Called from both pipeline stages (recovery and prefetch, see the main
-%   loop) with identical arguments -- which stage called it doesn't
-%   change what it does. st is the genState struct threaded through by
-%   value and returned updated (cfg, the waveform generator, is a handle
-%   object and mutates in place regardless).
-%
-%   Returns waveform = [] only on the real/retransmit path, and only when
-%   the new-data budget is spent AND no retransmit is queued -- there is
-%   genuinely nothing to build. The calibration path never does this: while
-%   ~linkEstablished there is always a calibration burst to send.
+%   Called identically from both pipeline stages (recovery and
+%   prefetch). Returns waveform = [] only on the real/retransmit path,
+%   when the new-data budget is spent and nothing is queued to retransmit
+%   -- the calibration path always has a burst to send.
     if ~linkEstablished
         st.calibBurstNum = st.calibBurstNum + 1;
         pktPayloadLen = cfg.UPL - 8;
@@ -595,10 +517,9 @@ function [waveform, meta, st, genElapsed] = localGenerateBlock( ...
         return;
     end
 
-    %% Real/retransmit path. A queued retransmit request has strict
-    % priority; otherwise the next normal sequential burst, unless the
-    % new-data budget is already spent -- in which case there is nothing
-    % to generate this call, and the caller (main loop) sends nothing.
+    %% Real/retransmit path: a queued retransmit request has strict
+    % priority; otherwise the next sequential burst, unless the new-data
+    % budget is already spent.
     isRetransmit = ~isempty(st.retransmitQueue);
     if ~isRetransmit && st.frameSeqNum >= config.maxFrames
         waveform = [];
@@ -611,9 +532,7 @@ function [waveform, meta, st, genElapsed] = localGenerateBlock( ...
     pktPayloadLen = cfg.UPL - 8;
     framesPerBurst = localFramesPerBurst(cfg, blockSamples, numel(st.txFifo));
 
-    % CAP BY WHAT GENERATION CAN AFFORD -- unchanged reasoning from before
-    % the split, just now bounded by this process's OWN generation budget
-    % rather than S1's combined generation+transmit budget.
+    % Cap by what generation can afford within this process's own budget.
     maxRealFrames = max(1, floor(genBudgetSec / max(st.genSecPerFrame, eps)));
     framesPerBurst = min(framesPerBurst, maxRealFrames);
 
@@ -673,21 +592,20 @@ end
 function n = localFramesPerBurst(cfg, blockSamples, fifoLen)
 %LOCALFRAMESPERBURST How many PLFRAMEs to build to cover one radio block.
 %
-%   Sized from what is still MISSING (blockSamples - fifoLen) rather than
-%   from the block alone, which is what keeps the transmit FIFO bounded.
-%   Never returns 0: a burst is always generated. Skipping one would
-%   consume packet indices or pop a retransmit request without sending
-%   either.
+%   Sized from what's still missing (blockSamples - fifoLen) rather than
+%   the block alone, keeping the transmit FIFO bounded. Never returns 0
+%   -- skipping a burst would consume packet indices or pop a retransmit
+%   request without sending either.
     n = max(1, ceil((blockSamples - fifoLen) / localPLFrameSamples(cfg)));
 end
 
 function n = localPLFrameSamples(cfg)
 %LOCALPLFRAMESAMPLES Length of one PLFRAME, in samples, at the current MODCOD.
 %
-%   A FECFRAME is a fixed number of BITS, so its symbol count falls as the
-%   modulation gets denser. The modulation is read from the object rather
-%   than mapped from the MODCOD index, so this cannot drift out of step
-%   with what the generator is actually producing.
+%   A FECFRAME is a fixed number of bits, so symbol count falls as
+%   modulation gets denser. Modulation is read from the object itself
+%   (not mapped from the MODCOD index) so this can't drift out of sync
+%   with what the generator actually produces.
     switch string(info(cfg).ModulationScheme)
         case "QPSK",   bitsPerSym = 2;
         case "8PSK",   bitsPerSym = 3;

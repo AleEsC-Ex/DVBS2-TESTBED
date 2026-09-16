@@ -1,3 +1,4 @@
+
 # DVB-S2 Satellite Testbed — Architecture & Function Map
 
 A working inventory of the five processes that make up the testbed's live signal
@@ -88,16 +89,34 @@ write-up, point 7).
 Ports: TX 2 GHz / RX 500 MHz (`192.168.10.2`), server `:30007` (TX blocks
 in, from S1b), client `:30006`\* (raw uplink samples out, to S1b).
 
-### `S1b_ACMControl.m` — Waveform generation, ACM control, uplink recovery
-Owns everything S1a does not: the DVB-S2 waveform generator and transmit
-FIFO, ACM policy (MODCOD selection from feedback, applied locally — no
-network hop needed since generation lives here too), the selective-repeat
-ARQ retransmit queue, and — in RF mode — the whole CCSDS Telecommand uplink
-receive chain. Paces itself against wall-clock time explicitly, one block
-ahead of what it sends (see §9, point 7), since it no longer sits downstream
-of a blocking radio call to pace it implicitly.
-Ports: client `:30007` (TX blocks out, to S1a), server `:30006`\* (raw
-uplink samples in, from S1a), server `:30001`\*\*, server `:30004`\*\*.
+### `S1b_ACMControl.m` — Waveform generation, ACM control, and uplink decoding
+S1b owns the functions that determine **what should be transmitted** and how
+the system reacts to link-quality feedback. It contains the DVB-S2 waveform
+generator, transmit FIFO, ACM policy, selective-repeat ARQ retransmission
+queue, and CCSDS Telecommand uplink decoder.
+
+S1b does not access either USRP directly. S1a remains responsible for both
+radio interfaces because the downlink transmitter and uplink receiver share
+the same USRP-2920 and IP address. S1b exchanges data with S1a over TCP:
+generated downlink sample blocks are sent to S1a, while raw uplink samples
+are received from S1a in RF mode.
+
+The uplink decoder is split between the two processes. S1a performs the
+radio-adjacent acquisition stages and forwards candidate CLTUs after ASM
+correlation. S1b performs the later derandomization and LDPC decoding stages,
+then parses the decoded command. This keeps continuous sample-rate work close
+to the radio while placing the occasional command decoding and control logic
+in S1b.
+
+Since S1b no longer calls the blocking radio-transmit API, it cannot use that
+API as an implicit real-time clock. It therefore uses explicit wall-clock
+pacing and a one-block look-ahead buffer. S1a retains a bounded local
+dummy-filler fallback so a temporary generation delay does not immediately
+leave the transmitter without samples.
+
+Ports: client `:30007` (TX blocks to S1a), server `:30006`* (raw uplink
+samples from S1a, RF mode only), and—when S1b hosts the control listeners—
+servers `:30001`** and `:30004`**.
 
 ### `S2a_RFAcquisition.m` — Downlink front end
 The only process that touches the receive radio. Runs DC-offset/AGC
@@ -565,69 +584,45 @@ carrier — the FIFO's existing backlog covers it.
 > longer true of what the code does today. Not a functional bug, just a
 > comment that wants updating to match the current mechanism.
 
-**7 · Generation moved to its own process, and the pacing/pipelining that
-required — S1a/S1b.**
-Generation, the transmit FIFO, and ACM policy all used to live in the same
-process as the radios, where `radioTx()`'s own blocking call implicitly
-paced the whole loop to real time. Splitting the radios out into
-`S1a_Transmitter.m` removed that implicit clock; `S1b_ACMControl.m` paces
-itself explicitly instead, waiting out whatever remains of one block's
-airtime after each send, so ACM feedback keeps arriving at the same
-debounced ~400 ms cadence it always did rather than being evaluated on
-every individual report the moment the two concerns were split apart (the
-first attempt at this split did exactly that, and MODCOD started
-oscillating as a result — a single bad SNR estimate reaching an
-unprotected `agreeCountDown=1, minDwellSecDown=0` policy was enough to
-trigger a spurious multi-rung drop).
+**7 · Generation, pacing, and buffering — S1a/S1b.**
 
-That still leaves a synchronous, single-buffered link between the two
-processes exposed to one thing the old single-process design never had to
-worry about: a generation tick that runs long has nothing to fall back on
-but S1a stalling with nothing to send. Measured on hardware, raising
-`config.tx.genBudgetFraction` to buy back idle time this way made loss
-*worse*, not better (16.1% dummy filler / 7.2% generation-deadline misses /
-2.5% TX underruns / 11.8% frame loss at 0.35, versus 5.4% / 24.8% / 11.0% /
-25.9% at 0.55) — the idle time it was spending was the margin keeping ticks
-close to their deadline, not waste.
+Moving waveform generation and ACM control out of S1a separated CPU-intensive
+work from the radio I/O, but it also removed the blocking transmit call that
+previously provided an implicit timing reference. TCP delivery alone is not a
+real-time pacing mechanism: a block can be buffered and delivered in bursts,
+and a generation operation can occasionally exceed the airtime represented by
+the next block.
 
-The fix is a one-block lookahead pipeline in S1b's main loop
-(`pendingBlock`/`pendingMeta`), plus a local fallback in S1a for whenever
-that pipeline still comes up empty:
+S1b therefore schedules generation against the configured block duration,
+`config.tx.blockSamples / config.usrp.sampleRate`, and maintains a one-block
+look-ahead buffer. The buffer is intended to absorb occasional generation
+jitter rather than to provide an unlimited queue or a hard real-time
+guarantee.
 
-- **Prefetch.** S1b generates one block *ahead* of the one it is currently
-  sending, so an occasional slow tick is absorbed by the already-ready
-  queued block instead of stalling S1a directly.
-- **Stale-drop.** A pending block was built for whatever MODCOD/link-state
-  was current when it was generated. If ACM has since moved on before it
-  ships, sending it anyway would push one more block at a MODCOD the
-  policy has already abandoned — exactly what the deliberately
-  zero-dwell, one-report downward switch (point 4 above) exists to
-  prevent. S1b drops it instead (`blocksDropped` in its profile) and
-  regenerates fresh.
-- **Local dummy fallback.** If S1a's wait for the next TX block runs past
-  a bounded threshold — comfortably under one full block period — it stops
-  waiting and synthesizes its own dummy PLFRAME via `dvbs2DummyFiller.m`
-  rather than let the carrier drop (`localDummyBlocksSent` in its own
-  profile). This is expected, not an error condition: it is what a tick
-  where S1b's new-data budget is exhausted, or where a stale block just
-  got dropped, looks like from S1a's side.
+The pipeline has three relevant behaviors:
 
-Measured back to back on the same hardware, all four configurations
-climbing to 32APSK under comparably heavy load: 0.35 without the pipeline
-(11.8% frame loss, the pre-existing baseline above), 0.55 without it
-(25.9%, the collapse this was built to fix), 0.35 with the pipeline
-(11.1%), and 0.45 with the pipeline (13.2% filler / 25.8% misses / 14.0%
-underruns / **8.0% loss** — the best frame-loss figure of the four, despite
-the worst internal misses/underruns numbers of the four). The pattern
-holds: once a slow tick has somewhere to land other than S1a's radio,
-internal timing pressure stops translating into frame loss the way it used
-to — the two mechanisms above absorb it instead, at the cost of somewhat
-more filler and more TX underruns than the single-buffered design paid
-when it wasn't under enough load to expose the problem at all. See the
-measurement history in `config.tx.genBudgetFraction`'s own comment in
-`dvbs2TestbedConfig.m` for the full numbers.
+- **Prefetch:** S1b prepares a block ahead of its transmission deadline so
+  normal generation variability does not immediately stall S1a.
+- **Stale-block handling:** a pending block is associated with the MODCOD and
+  link state used when it was generated. If ACM changes before transmission,
+  S1b can discard the stale block and regenerate it under the current state
+  instead of knowingly transmitting obsolete modulation/coding settings.
+- **Local continuity fallback:** if S1a does not receive a usable block within
+  its bounded wait interval, it generates a local dummy PLFRAME. This keeps
+  the radio input fed, but it should be interpreted as a continuity safeguard,
+  not as evidence that S1b met its generation deadline.
 
----
+The explicit pacing and look-ahead design reduces the coupling between
+generation latency and radio output. It does not eliminate CPU contention,
+TCP scheduling variability, or USRP underruns; those remain measurable
+implementation effects and should be evaluated using the runtime profile
+rather than inferred from the presence of the buffer alone.
+
+The ACM policy is intentionally asymmetric: downward decisions can react
+immediately to evidence of degradation, while upward decisions require
+stronger agreement and dwell time. This policy behavior is separate from the
+transport pipeline: pacing determines when blocks are prepared and supplied,
+whereas ACM determines which MODCOD newly generated blocks should use.
 
 ## 10 · Hardware bring-up scripts — `sdr_test/`
 

@@ -124,7 +124,7 @@ config.uplink.inter_decimateFactor = 500;
 config.uplink.sampleRate = config.usrp.masterClockRate / config.uplink.inter_decimateFactor;
 
 % Uplink symbol rate mapping.
-config.uplink.samplesPerSymbol = 20; % Shall be an integer value.
+config.uplink.samplesPerSymbol = 10; % Shall be an integer value.
 config.uplink.symbolRate = config.uplink.sampleRate / config.uplink.samplesPerSymbol;
 
 % Root-raised-cosine shaping variables.
@@ -159,7 +159,7 @@ config.uplink.rxGain = 30;
 
 config.uplink.maxPayloadBytes = 8;
 config.uplink.burstSamples = ...
-    ceil(16000/config.uplink.samplesPerSymbol) * config.uplink.samplesPerSymbol;   
+    ceil(config.uplink.symbolRate*2/config.uplink.samplesPerSymbol) * config.uplink.samplesPerSymbol;   
 
 %% Uplink receiver (Functions/Uplink/ccsdsUplinkReceive.m)
 config.uplink.rxFrameLength = 8192;

@@ -3,34 +3,6 @@
     Starts every DVB-S2 testbed process, each in its own console-only
     MATLAB window, without you opening MATLAB by hand and typing run(...)
     once per script.
-
-.HOW THIS WORKS, FOR SOMEONE WHO HASN'T SCRIPTED THIS BEFORE
-    Every S*.m script already finds its own folder via mfilename('fullpath')
-    and adds Testbed/Functions/ to its own path, and every inter-process
-    link uses a connect-with-retry helper (dvbs2TCPConnectRetry /
-    dvbs2TCPServerRetry). That means STARTUP ORDER DOES NOT MATTER -- this
-    script can open all five windows back to back with no coordination
-    logic, and each one just waits until its counterpart shows up on the
-    expected port.
-
-    All this script does, five times over, is:
-      1. build the command line MATLAB needs ( -r "run('...')" )
-      2. hand it to Start-Process, which opens a new window and returns
-         immediately (it does NOT wait for that window to finish)
-
-    Stopping a window later (Stop-DVBS2Testbed.ps1) does NOT use the PID
-    Start-Process returns here -- that PID belongs to a short-lived
-    bootstrap process which hands off to the real, long-running MATLAB
-    engine as a CHILD process and then exits within a second or two, so by
-    the time anything tries to stop it, it is already gone. Stop-
-    DVBS2Testbed.ps1 finds the real engine by matching its command line
-    against each script's name instead; see that file's own header for the
-    full story.
-
-.USAGE
-    Just run this file from PowerShell:  .\Launch-DVBS2Testbed.ps1
-    To add the planned fifth process once it exists, uncomment its line
-    in $scripts below -- nothing else in this file needs to change.
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -49,15 +21,7 @@ $scripts = @(
     @{ Name = 'S3';  File = 'S3_ProcessingUnit.m' }
 )
 
-# Seconds to wait between opening each window. Not needed for correctness
-# (every script retries its own connections) -- it's what's actually fixing
-# the resource contention diagnosed on the 2026-09-08 13:16 run: four MATLAB
-# processes cold-starting within ~4.5 s of each other produced 214 RX
-# overruns, 25 TX underruns and 10.8% frame loss, none of it from a code bug
-# -- purely from four license checks / JIT compiles / USRP driver inits
-# competing for the same CPU cores at once. 15 s spaces that out so each
-# process's expensive one-time startup cost has mostly settled before the
-# next one begins competing for it.
+# Seconds to wait between opening each window.
 $staggerSeconds = 1
 
 # ---------------------------------------------------------------------

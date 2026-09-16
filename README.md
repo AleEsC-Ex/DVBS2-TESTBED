@@ -113,7 +113,7 @@ MODCOD ladder:
 | Split design, with generation pipeline | **8.0% – 11.1%** |
 
 **Known open issues:**
-- 
+- The uplink TX radio underruns in several occasion (4092 underruns in 420s) which probably is producing that the reciever don't recieve the CLTUs correctly, loosing some of them in the process and failing at the recovery in others (almost 30-40% of the CLTUs are lost).
 - There is no way to cut the link in case it is necessary and look for a re-establishment of the link. With this I mean that is not possible to return to the link acquisition loop in order to keep transmitting if the actual link is lost or not well established.
 
 

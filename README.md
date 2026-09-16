@@ -113,13 +113,9 @@ MODCOD ladder:
 | Split design, with generation pipeline | **8.0% – 11.1%** |
 
 **Known open issues:**
-- A missing MATLAB event-queue yield in `S2a_RFAcquisition.m` was breaking
-  the retransmit-request relay entirely (0 requests relayed for a whole
-  run). Fixed in code; not yet re-verified on hardware.
-- Every hardware run this session showed RSSI collapsing permanently to
-  the noise floor partway through, traced to a UHD driver crash
-  (`WSAENOBUFS`, Windows socket-buffer exhaustion). Possibly connected to
-  the same root cause as the retransmit bug above; not yet confirmed.
+- 
+- There is no way to cut the link in case it is necessary and look for a re-establishment of the link. With this I mean that is not possible to return to the link acquisition loop in order to keep transmitting if the actual link is lost or not well established.
+
 
 See `dvbs2TestbedConfig.m`'s inline comments (particularly around
 `config.tx.genBudgetFraction`) for the full measurement history behind

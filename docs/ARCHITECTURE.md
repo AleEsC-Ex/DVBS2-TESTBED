@@ -646,7 +646,14 @@ S1a/S1b. `sdrTestConfig.m` holds the shared settings for this group.
 > as something the live system calls.
 
 ---
+## 11 · Future extensions
 
+- **Short Frames.** The current design implements the DVB-S2 communication protocol end to end (transmission, reception and payload processing), but it still works on random payload data rather than real files. To make the testbed useful for an actual mission, the next step is building the functions that turn raw files or data streams into packets. Once real data is flowing, the natural follow-up is a system that decides whether there's enough queued data to justify a SHORT frame instead of the default NORMAL frame — avoiding the need to pad the payload with random filler just to reach the frame length. If this extension is implemented, `config.rxReject.requireNormalFrame` must be disabled, since the receiver currently rejects any short frame outright.
+
+- **Non-pilot-based recovery.** The receiver currently discards any frame without pilots, since there's no block to correct its CFO or phase offset. Implementing one would improve throughput, as non-pilot frames save several symbols per frame that would otherwise go to pilot overhead. The proposed approach is straightforward: extract the SOF and PLS codes — both fixed, known sequences — and compare the received symbols against their ideal values to estimate CFO and phase offset. This is exactly what the existing pilot-based correction blocks already do, just with pilot symbols added into the comparison. The simplest path is therefore extending those blocks to search for pilot symbols or not, depending on whether the frame declares pilots present. The open question is *why* bother with non-pilot frames if they're less robust — and answering that requires finding the optimal pilot/non-pilot frame ratio: use the pilot frames for SNR measurement, and lean on non-pilot frames for throughput only once there's enough margin to guarantee they'll still be received reliably.
+
+- **ACM policy replication.** A possible (not necessarily essential) extension is predicting the transmitter's ACM/MODCOD decisions on the ground-station side, so the receiver always knows which MODCOD to expect next. This would let it flag or discard frames reporting a MODCOD wildly different from the expected one. It's straightforward in principle — the ground station is the source of the SNR reports the transmitter's ACM policy runs on, so it already has the same information available. The real work is handling reporting latency and lost reports correctly in the prediction.
+---
 *DVB-S2 satellite ground-segment testbed — Erasmus project, Aarhus
 University. Covers the two standards implemented, the process/function
 inventory, and the ACM control loop in detail. Deeper theory for individual

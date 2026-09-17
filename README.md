@@ -4,8 +4,7 @@ A software-defined DVB-S2 forward link and CCSDS Telecommand return link,
 built on two NI USRPs, for an Erasmus exchange project at Aarhus
 University. The system implements a full transmit/receive chain with
 adaptive coding & modulation (ACM), selective-repeat ARQ, and independent
-BER/PER measurement — not a simulation of one, an actual RF link running
-on real radios.
+BER/PER measurement.
 
 **Platform:** MATLAB R2026a, Windows 11
 **Hardware:** NI USRP-2920 (`192.168.10.2` — downlink TX @ 2 GHz + uplink
@@ -27,16 +26,14 @@ the payload downlink at a rate UHF could never sustain.
 - **Payload downlink, S-band (2 GHz here):** the CubeSat transmits its
   payload data down to the ground station over DVB-S2 — an increasingly
   common choice for smallsat downlinks that need more throughput than
-  legacy formats, backed by mature, off-the-shelf ground equipment.
+  legacy formats, off-the-shelf ground equipment.
 - **Command uplink, UHF (500 MHz here):** the CubeSat's receive antenna is
-  UHF, so commanding runs over CCSDS Telecommand — the standard real
-  missions use for spacecraft commanding — instead of riding on the
-  S-band carrier.
+  UHF, so commanding runs over CCSDS Telecommand, a standard use for spacecraft commanding.
 
-Mapped onto the five processes: **S1a/S1b are the CubeSat** — it
+Mapped onto the five processes: **S1a/S1b are the CubeSat**, it
 transmits its DVB-S2 downlink at 2 GHz and receives commands on its UHF
 receiver at 500 MHz, both on the same physical radio (`192.168.10.2`).
-**S2a/S2b/S3 are the ground station** — it receives the S-band downlink
+**S2a/S2b/S3 are the ground station**, it receives the S-band downlink
 and transmits back over UHF whatever the link needs to send up: ACM
 feedback (so the CubeSat knows what MODCOD the channel currently
 supports) and selective-repeat ARQ retransmit requests for any payload
@@ -61,7 +58,7 @@ the mission, not just which USRP happens to transmit first.
   not just a pass/fail log.
 - **Two operating modes:** real RF over the USRPs (`config.useSDR = true`),
   or a fully simulated channel model over TCP loopback with no hardware
-  attached at all (`config.useSDR = false`) — useful for developing and
+  attached at all (`config.useSDR = false`), useful for developing and
   testing the DSP/control logic without radio access.
 
 ## Architecture at a glance
@@ -71,8 +68,8 @@ startable in any order:
 
 | Process | Role |
 |---|---|
-| `S1a_Transmitter.m` | Owns both radios (shared IP constraint). Radio I/O only — generates nothing of its own. |
-| `S1b_ACMControl.m` | Waveform generation, ACM policy, transmit FIFO, CCSDS uplink receive chain. |
+| `S1a_Transmitter.m` | Owns both radios (shared IP constraint). Radio I/O, uplink corrections and CLTU detection |
+| `S1b_ACMControl.m` | Waveform generation, ACM policy, transmit FIFO, CLTU command recovery chain. |
 | `S2a_RFAcquisition.m` | Downlink front end (DC block, RSSI, AGC) and, in RF mode, the return-link gateway. |
 | `S2b_Reciever.m` | The DVB-S2 physical-layer DSP chain: frame sync, timing/CFO/phase recovery, per-frame SNR estimation. |
 | `S3_ProcessingUnit.m` | LDPC/BCH decode, BER/PER measurement, and selective-repeat ARQ. |
@@ -106,16 +103,11 @@ run on real USRPs. Per-run console logs land in `logs/` (gitignored).
 Measured on hardware, all runs reaching well into the 32APSK end of the
 MODCOD ladder:
 
-| Configuration | Frame loss |
-|---|---|
-| Original single-process design | 1.3% – 10.8% (run-to-run RF variance) |
-| Split design, no generation pipeline | 11.8% – 25.9% |
-| Split design, with generation pipeline | **8.0% – 11.1%** |
+The current status suffer of a uplink TX inestability as it is underruning during the whole tests, however the last tests show one of its lower values (1923 underruns) while obtaining a more stable performance in the downlink RX which report a total of 116 overruns which are not growing constantly. The frame lost are only 142/5740 (2.5%) which might be a good result taking into account previous results. Nevertheless the main problem that affect this code might be the uplink RX that probably because of the underruning or other causes it is reporting a significantly lower amount of CLTUs detected than the reports sent by the uplink TX (439/681 detected while 420 are being decoded correctly).
 
 **Known open issues:**
-- The uplink TX radio underruns in several occasion (4092 underruns in 420s) which probably is producing that the reciever don't recieve the CLTUs correctly, loosing some of them in the process and failing at the recovery in others (almost 30-40% of the CLTUs are lost).
+- The uplink TX radio underruns in several occasion which probably is producing that the reciever don't recieve the CLTUs correctly, loosing some of them in the process and failing at the recovery in others (almost 30-40% of the CLTUs are lost). The last modifications implemented in order to address this problem has been testing different values for the SPS and other parameters related to the uplink transmitter, as well as droping the samples extract from the downlink RX buffer.
 - There is no way to cut the link in case it is necessary and look for a re-establishment of the link. With this I mean that is not possible to return to the link acquisition loop in order to keep transmitting if the actual link is lost or not well established.
-
 
 See `dvbs2TestbedConfig.m`'s inline comments (particularly around
 `config.tx.genBudgetFraction`) for the full measurement history behind

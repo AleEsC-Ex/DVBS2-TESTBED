@@ -103,11 +103,10 @@ config.simChannel.EsNodBEdge = 4;
 config.simChannel.cfoPeakHz = 0;          
 
 %% Burst / chunking parameters
-config.burstFrames = 4;   % Retained for reference only
 % Samples read from the simulated channel or radio per acquisition chunk.
-config.chunkLength = floor(2*66564/config.dvbs2.SamplesPerSymbol);   
+config.chunkLength = floor(66564/(2*config.dvbs2.SamplesPerSymbol));   
 % Samples read by the DSP loop per iteration from the RF acquisition stream.
-config.rfAcqReadChunkLength = 2*66564;
+config.rfAcqReadChunkLength = 4*config.chunkLength;
 
 %% Uplink: CCSDS Telecommand (Functions/Uplink/, sdr_test/UplinkTx+UplinkRx)
 % Toggles closing the loop over the air instead of via TCP loopback.
@@ -124,7 +123,7 @@ config.uplink.inter_decimateFactor = 500;
 config.uplink.sampleRate = config.usrp.masterClockRate / config.uplink.inter_decimateFactor;
 
 % Uplink symbol rate mapping.
-config.uplink.samplesPerSymbol = 10; % Shall be an integer value.
+config.uplink.samplesPerSymbol = 14; % Shall be an integer value.
 config.uplink.symbolRate = config.uplink.sampleRate / config.uplink.samplesPerSymbol;
 
 % Root-raised-cosine shaping variables.

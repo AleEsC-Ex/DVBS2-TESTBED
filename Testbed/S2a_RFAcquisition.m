@@ -146,7 +146,7 @@ while true
         prof.radioRx = prof.radioRx + toc(tRx);
         if overrun
             overrunCount = overrunCount + 1;
-            warning('S2a:RXOverrun', 'RX overrun detected -- samples were dropped by the radio/host link.');
+            %warning('S2a:RXOverrun', 'RX overrun detected -- samples were dropped by the radio/host link.');
         end
         if validLen < length(newSamples)
             newSamples = newSamples(1:validLen);

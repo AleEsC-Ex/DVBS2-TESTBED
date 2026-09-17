@@ -123,7 +123,7 @@ config.uplink.inter_decimateFactor = 500;
 config.uplink.sampleRate = config.usrp.masterClockRate / config.uplink.inter_decimateFactor;
 
 % Uplink symbol rate mapping.
-config.uplink.samplesPerSymbol = 10; % Shall be an integer value.
+config.uplink.samplesPerSymbol = 14; % Shall be an integer value.
 config.uplink.symbolRate = config.uplink.sampleRate / config.uplink.samplesPerSymbol;
 
 % Root-raised-cosine shaping variables.
